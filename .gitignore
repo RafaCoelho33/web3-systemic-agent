@@ -1,0 +1,12 @@
+env
+.gemini/*
+CONTEXT.md
+GEMINI.md
+.env
+__pycache__/
+.pytest_cache/
+*.pyc
+data/
+*.db
+*.sqlite
+*.sqlite3
