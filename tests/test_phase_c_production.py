@@ -20,9 +20,12 @@ Validates Phase C deliverables:
 import os
 import re
 import sys
+from pathlib import Path
 from typing import Dict, Any, List
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from eth_account import Account
+from fastapi.testclient import TestClient
 import httpx
 import pytest
 
@@ -49,6 +52,20 @@ try:
         ALERT_SEVERITY_ORDER,
     )
     from scripts.governance_listener import run_listener
+    from src.api import create_app
+    from src.engine import ConditionAgentEngine
+    from src.storage import AgentStorage
+    from src.chain_inspector import ChainInspector
+    from src.semantic_evaluator import (
+        GeminiSemanticEvaluator,
+        MockSemanticEvaluator,
+    )
+    from src.x402_payment import (
+        X402Config,
+        MockX402Facilitator,
+        create_eip3009_payment_header,
+        usdc_to_atomic,
+    )
 except ImportError:
     from schemas import (
         ChainId,
@@ -63,6 +80,20 @@ except ImportError:
         ALERT_SEVERITY_ORDER,
     )
     from governance_listener import run_listener
+    from api import create_app
+    from engine import ConditionAgentEngine
+    from storage import AgentStorage
+    from chain_inspector import ChainInspector
+    from semantic_evaluator import (
+        GeminiSemanticEvaluator,
+        MockSemanticEvaluator,
+    )
+    from x402_payment import (
+        X402Config,
+        MockX402Facilitator,
+        create_eip3009_payment_header,
+        usdc_to_atomic,
+    )
 
 
 class TestPhaseCDockerContainerization:
@@ -379,3 +410,161 @@ class TestPhaseCWebhookAlertDispatcher:
             call_args, call_kwargs = mock_dispatch.call_args
             assert len(call_args[0]) == 2
             assert call_kwargs.get("min_alert_level") == "WARNING"
+
+
+@pytest.fixture
+def temp_storage(tmp_path: Path) -> AgentStorage:
+    """Provides an isolated SQLite AgentStorage instance backed by tmp_path."""
+    db_file = tmp_path / "test_phase_c_security.db"
+    return AgentStorage(db_path=str(db_file))
+
+
+class TestPhaseCSecurityHardening:
+    """
+    Test suite validating Phase C security hardening protections:
+    1. Per-IP Rate Limiting with Cloudflare CF-Connecting-IP header support.
+    2. Zero-LLM-drain cost protection on /governance/audit-proposals for unauthenticated requests.
+    3. Strict gate 402 Payment Required enforcement when configured.
+    4. Authenticated proposal auditing with EIP-3009 payment settlement.
+    5. Live facilitator default configuration in deployment templates.
+    """
+
+    def test_rate_limiter_blocks_excessive_requests_from_same_ip(self, temp_storage):
+        """Rate limiter blocks excessive requests from the same IP with 429 Too Many Requests and Retry-After header."""
+        app = create_app(storage=temp_storage, rate_limit_per_minute=3)
+        client = TestClient(app)
+
+        for _ in range(3):
+            resp = client.get("/")
+            assert resp.status_code == 200
+
+        resp4 = client.get("/")
+        assert resp4.status_code == 429
+        assert resp4.headers.get("retry-after") == "60" or resp4.headers.get("Retry-After") == "60"
+        data = resp4.json()
+        assert data.get("error") == "TooManyRequests"
+
+    def test_rate_limiter_isolates_ips_via_cloudflare_header(self, temp_storage):
+        """Rate limiter identifies clients using CF-Connecting-IP so an attacking IP does not block legitimate IPs."""
+        app = create_app(storage=temp_storage, rate_limit_per_minute=2)
+        client = TestClient(app)
+
+        cf_attacker = {"CF-Connecting-IP": "203.0.113.99"}
+        cf_legitimate = {"CF-Connecting-IP": "198.51.100.42"}
+
+        for _ in range(2):
+            resp = client.get("/", headers=cf_attacker)
+            assert resp.status_code == 200
+
+        resp3 = client.get("/", headers=cf_attacker)
+        assert resp3.status_code == 429
+
+        resp_legit = client.get("/", headers=cf_legitimate)
+        assert resp_legit.status_code == 200
+
+    def test_governance_audit_proposals_unauthenticated_never_invokes_paid_llm(self, temp_storage):
+        """Unauthenticated requests to /governance/audit-proposals never invoke the paid LLM engine."""
+        paid_evaluator = MagicMock(spec=GeminiSemanticEvaluator)
+        paid_evaluator.evaluate = AsyncMock(
+            side_effect=AssertionError("Paid LLM should not be invoked without payment!")
+        )
+
+        paid_engine = ConditionAgentEngine(
+            rpc_url="https://sepolia.base.org",
+            semantic_evaluator=paid_evaluator,
+            storage=temp_storage,
+        )
+        paid_engine.process_rule = AsyncMock(
+            side_effect=AssertionError("Paid LLM should not be invoked without payment!")
+        )
+
+        cfg = X402Config(enabled=True)
+        app = create_app(engine=paid_engine, storage=temp_storage, x402_config=cfg)
+        client = TestClient(app)
+
+        async def mock_eval_det(*args, **kwargs):
+            return DeterministicResult(
+                passed=True,
+                reason="ok",
+                observed_data={},
+            )
+
+        with patch.object(ChainInspector, "evaluate_deterministic", side_effect=mock_eval_det):
+            resp = client.post("/governance/audit-proposals", json={"limit": 1})
+            assert resp.status_code == 200
+            paid_engine.process_rule.assert_not_called()
+
+    def test_governance_audit_proposals_strict_gate_returns_402_when_configured(
+        self, temp_storage, monkeypatch
+    ):
+        """When X402_GATE_GOVERNANCE is configured, unauthenticated requests return 402 Payment Required."""
+        monkeypatch.setenv("X402_GATE_GOVERNANCE", "true")
+        cfg = X402Config(enabled=True)
+        app = create_app(storage=temp_storage, x402_config=cfg)
+        client = TestClient(app)
+
+        resp = client.post("/governance/audit-proposals", json={"limit": 1})
+        assert resp.status_code == 402
+        assert resp.headers.get("X-PAYMENT-REQUIRED") == "true" or "Payment" in resp.text
+
+    def test_governance_audit_proposals_with_valid_payment_invokes_paid_engine_and_settles(
+        self, temp_storage
+    ):
+        """Valid EIP-3009 payment invokes the paid engine, returns 200, and records settlement in ledger."""
+        buyer = Account.create()
+        cfg = X402Config(enabled=True)
+        facilitator = MockX402Facilitator()
+
+        paid_evaluator = MockSemanticEvaluator()
+        paid_engine = ConditionAgentEngine(
+            rpc_url="https://sepolia.base.org",
+            semantic_evaluator=paid_evaluator,
+            storage=temp_storage,
+        )
+
+        app = create_app(
+            engine=paid_engine,
+            storage=temp_storage,
+            x402_config=cfg,
+            facilitator=facilitator,
+        )
+        client = TestClient(app)
+
+        payment_header = create_eip3009_payment_header(
+            account=buyer,
+            pay_to_address=cfg.pay_to_address,
+            amount_atomic=usdc_to_atomic(cfg.price_per_eval_usdc),
+            network=cfg.network,
+        )
+
+        async def mock_eval_det(*args, **kwargs):
+            return DeterministicResult(
+                passed=True,
+                reason="ok",
+                observed_data={},
+            )
+
+        with patch.object(ChainInspector, "evaluate_deterministic", side_effect=mock_eval_det), \
+             patch.object(paid_engine, "process_rule", wraps=paid_engine.process_rule) as spy_process:
+            resp = client.post(
+                "/governance/audit-proposals",
+                json={"limit": 1},
+                headers={"X-PAYMENT": payment_header},
+            )
+            assert resp.status_code == 200
+            assert spy_process.called
+
+            payments_resp = client.get("/payments")
+            assert payments_resp.status_code == 200
+            payments = payments_resp.json()
+            assert len(payments) >= 1
+            assert payments[0]["payer_address"].lower() == buyer.address.lower()
+
+    def test_env_example_live_facilitator_configured(self):
+        """`.env.example` documents X402_USE_LIVE_FACILITATOR for facilitator mode configuration."""
+        env_example_path = os.path.join(_ROOT_DIR, ".env.example")
+        assert os.path.isfile(env_example_path), ".env.example must exist at project root"
+        with open(env_example_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert "X402_USE_LIVE_FACILITATOR" in content
+        assert re.search(r"^X402_USE_LIVE_FACILITATOR\s*=", content, re.MULTILINE) is not None

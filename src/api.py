@@ -11,6 +11,7 @@ import logging
 import os
 import sys
 import re
+import time
 import traceback
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
@@ -101,6 +102,13 @@ except ImportError:
         get_curated_dao_proposals,
     )
 
+if not hasattr(X402Config, "price_atomic"):
+    setattr(
+        X402Config,
+        "price_atomic",
+        property(lambda self: usdc_to_atomic(self.price_per_eval_usdc)),
+    )
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_BATCH_MAX_ITEMS = 50
@@ -176,6 +184,7 @@ def create_app(
     storage: Optional[AgentStorage] = None,
     x402_config: Optional[X402Config] = None,
     facilitator: Optional[Any] = None,
+    rate_limit_per_minute: Optional[int] = None,
 ) -> FastAPI:
     """
     Creates and configures the FastAPI application instance.
@@ -213,6 +222,57 @@ def create_app(
         allow_headers=["*"],
         expose_headers=["X-PAYMENT-REQUIRED", "X-PAYMENT-RESPONSE", "PAYMENT-RESPONSE"],
     )
+
+    # Per-IP Sliding-Window Rate Limiter
+    try:
+        default_rate_limit = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
+    except (ValueError, TypeError):
+        default_rate_limit = 60
+    effective_rate_limit = (
+        rate_limit_per_minute
+        if rate_limit_per_minute is not None
+        else default_rate_limit
+    )
+
+    app.state.rate_limit_buckets = {}
+
+    if effective_rate_limit > 0:
+        @app.middleware("http")
+        async def rate_limit_middleware(request: Request, call_next):
+            client_ip = (
+                request.headers.get("cf-connecting-ip")
+                or (request.headers.get("x-forwarded-for", "").split(",")[0].strip())
+                or (request.client.host if request.client else "unknown")
+            )
+            if not client_ip:
+                client_ip = request.client.host if request.client else "unknown"
+
+            now = time.monotonic()
+            buckets = app.state.rate_limit_buckets
+
+            # Prune expired keys if dictionary grows large to bound memory
+            if len(buckets) > 5000:
+                cutoff = now - 60.0
+                expired_keys = [k for k, v in buckets.items() if not v or v[-1] < cutoff]
+                for k in expired_keys:
+                    buckets.pop(k, None)
+
+            # Prune timestamps older than 60.0 seconds for client_ip
+            timestamps = [ts for ts in buckets.get(client_ip, []) if now - ts < 60.0]
+            buckets[client_ip] = timestamps
+
+            if len(timestamps) >= effective_rate_limit:
+                return JSONResponse(
+                    status_code=429,
+                    content={
+                        "error": "TooManyRequests",
+                        "message": f"Rate limit of {effective_rate_limit} requests per minute exceeded.",
+                    },
+                    headers={"Retry-After": "60"},
+                )
+
+            buckets[client_ip].append(now)
+            return await call_next(request)
 
     # Associate engine, storage, worker pool, and x402 state with application
     active_engine = engine if engine is not None else ConditionAgentEngine()
@@ -1059,19 +1119,152 @@ def create_app(
         summary="Audit recent DAO governance proposals via Snapshot GraphQL or curated dataset",
     )
     async def audit_governance_proposals(
+        request: Request,
+        response: Response,
         req: Optional[GovernanceScanRequest] = None,
-    ) -> List[GovernanceAuditReport]:
+    ):
         """
         Audits recent DAO governance proposals for security risks, privilege escalations,
         and discrepancies using Snapshot or curated proposals.
         """
         scan_req = req or GovernanceScanRequest()
         connector = SnapshotGovernanceConnector(default_chain_id=scan_req.chain_id)
-        return await connector.audit_proposals(
-            engine=app.state.engine,
-            spaces=scan_req.spaces,
-            limit=scan_req.limit,
+        x402_cfg: X402Config = getattr(app.state, "x402_config", None) or X402Config()
+        storage_inst: Optional[AgentStorage] = getattr(app.state, "storage", None)
+
+        if not x402_cfg.enabled:
+            return await connector.audit_proposals(
+                engine=app.state.engine,
+                spaces=scan_req.spaces,
+                limit=scan_req.limit,
+            )
+
+        # Paid mode: when x402_cfg.enabled is True
+        payment_header = (
+            request.headers.get("x-payment")
+            or request.headers.get("payment-signature")
+            or request.headers.get("X-PAYMENT")
+            or request.headers.get("PAYMENT-SIGNATURE")
         )
+
+        if not payment_header:
+            if os.getenv("X402_GATE_GOVERNANCE", "false").strip().lower() in ("true", "1", "yes"):
+                return build_402_response(
+                    x402_cfg,
+                    request.url.path,
+                    x402_cfg.price_per_eval_usdc * scan_req.limit,
+                )
+            # Cost-free deterministic/mock engine fallback to prevent unauthenticated credit drain
+            active_engine = getattr(app.state, "engine", None)
+            safe_free_engine = ConditionAgentEngine(
+                rpc_url=getattr(active_engine, "rpc_url", None) if active_engine else None,
+                semantic_evaluator=MockSemanticEvaluator(),
+                storage=storage_inst,
+            )
+            return await connector.audit_proposals(
+                engine=safe_free_engine,
+                spaces=scan_req.spaces,
+                limit=scan_req.limit,
+            )
+
+        # payment_header is present when x402_cfg.enabled is True
+        required_usdc = x402_cfg.price_per_eval_usdc
+        required_atomic = usdc_to_atomic(required_usdc)
+
+        try:
+            payment_data = parse_x402_header(payment_header, default_network=x402_cfg.network)
+        except ValueError as exc:
+            return build_402_response(
+                x402_cfg,
+                request.url.path,
+                required_usdc,
+                reason=f"Malformed payment header: {exc}",
+            )
+
+        payment_id = payment_data["payment_id"]
+        if storage_inst and await storage_inst.is_payment_settled(payment_id):
+            return build_402_response(
+                x402_cfg,
+                request.url.path,
+                required_usdc,
+                reason="Payment already settled (replay detected)",
+            )
+
+        facilitator = getattr(app.state, "facilitator", None) or MockX402Facilitator()
+        ver = await facilitator.verify(payment_data, required_atomic, x402_cfg)
+        if not ver.valid:
+            return build_402_response(
+                x402_cfg,
+                request.url.path,
+                required_usdc,
+                reason=ver.reason or "Payment verification failed",
+            )
+
+        try:
+            reports = await connector.audit_proposals(
+                engine=app.state.engine,
+                spaces=scan_req.spaces,
+                limit=scan_req.limit,
+            )
+        except Exception as exc:
+            logger.exception(f"Error executing governance audit: {exc}")
+            if storage_inst is not None:
+                await storage_inst.log_error(
+                    stage="api",
+                    error_type="ServiceUnavailableNoCharge",
+                    message=f"Governance audit error: {str(exc)}",
+                    traceback_str=traceback.format_exc(),
+                    context={"path": str(request.url.path)},
+                )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "ServiceUnavailable",
+                    "message": "Execution failed due to upstream error. Payment was NOT settled.",
+                    "payment_settled": False,
+                },
+            )
+
+        settlement = await facilitator.settle(payment_data, required_atomic, x402_cfg)
+        if not settlement.settled:
+            if storage_inst is not None:
+                await storage_inst.log_error(
+                    stage="payment",
+                    error_type="SettlementError",
+                    message=settlement.error or "Failed to settle",
+                    context={"path": str(request.url.path)},
+                )
+            return build_402_response(
+                x402_cfg,
+                request.url.path,
+                required_usdc,
+                reason=settlement.error or "Payment settlement failed",
+            )
+
+        receipt = PaymentReceipt(
+            payment_id=payment_data["payment_id"],
+            payer_address=payment_data["payer_address"],
+            pay_to_address=x402_cfg.pay_to_address,
+            amount_usdc=round(required_usdc, 6),
+            amount_atomic=required_atomic,
+            network=payment_data.get("network") or x402_cfg.network,
+            asset=x402_cfg.asset,
+            tx_hash=settlement.tx_hash or "",
+            endpoint=request.url.path,
+            settled_at=datetime.now(timezone.utc).isoformat(),
+        )
+        if storage_inst is not None:
+            await storage_inst.record_payment(receipt)
+
+        receipt_summary = json.dumps({
+            "tx_hash": receipt.tx_hash,
+            "payment_id": receipt.payment_id,
+            "amount_usdc": receipt.amount_usdc,
+        })
+        response.headers["X-PAYMENT-RESPONSE"] = receipt_summary
+        response.headers["PAYMENT-RESPONSE"] = receipt_summary
+
+        return reports
 
     return app
 
