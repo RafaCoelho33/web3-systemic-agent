@@ -672,3 +672,48 @@ class TestRepositoryLicense:
             "README.md must contain 'PolyForm Noncommercial'"
         )
 
+
+class TestPhaseCBazaarAndCDPMainnet:
+    """Validates Bazaar discovery metadata extensions and CDP facilitator authentication provider."""
+
+    def test_bazaar_discovery_extension_included_in_402_response(self):
+        """HTTP 402 payload must include Bazaar discovery extensions and rich metadata."""
+        import json
+        from src.x402_payment import X402Config, build_402_response
+
+        cfg = X402Config(enabled=True)
+        response = build_402_response(cfg, "/evaluate", 0.05)
+        body = json.loads(response.body)
+
+        assert "extensions" in body, "Expected 'extensions' key in 402 response body"
+        assert "bazaar" in body["extensions"], "Expected 'bazaar' extension in 402 response body"
+
+        accept_item = body["accepts"][0]
+        assert accept_item.get("discoverable") is True, "Expected accepts[0].discoverable to be True"
+        assert accept_item.get("mimeType") == "application/json", "Expected accepts[0].mimeType to be application/json"
+        assert "Pre-Transaction Security Firewall" in accept_item.get("description", ""), (
+            "Expected 'Pre-Transaction Security Firewall' in accepts[0].description"
+        )
+
+        bazaar_ext = body["extensions"]["bazaar"]
+        assert "info" in bazaar_ext, "Expected 'info' in extensions.bazaar"
+        assert "schema" in bazaar_ext, "Expected 'schema' in extensions.bazaar"
+
+    def test_cdp_api_key_config_and_auth_provider(self, monkeypatch):
+        """X402Config recognizes CDP API keys and CDPFacilitatorAuthProvider provides auth headers."""
+        monkeypatch.setenv("CDP_API_KEY_ID", "cdp-key-id-123")
+        monkeypatch.setenv("CDP_API_KEY_SECRET", "cdp-secret-xyz")
+        monkeypatch.delenv("FACILITATOR_URL", raising=False)
+
+        from src.x402_payment import X402Config, CDPFacilitatorAuthProvider
+
+        cfg = X402Config(enabled=True, network="eip155:8453")
+        assert cfg.has_cdp_credentials() is True
+        assert cfg.facilitator_url == "https://api.cdp.coinbase.com/platform/v2/x402"
+
+        provider = CDPFacilitatorAuthProvider(cfg.cdp_api_key_id, cfg.cdp_api_key_secret)
+        headers = provider.get_auth_headers()
+        assert headers.verify["X-CDP-API-KEY-ID"] == "cdp-key-id-123"
+        assert "Bearer cdp-secret-xyz" in headers.settle["Authorization"]
+
+

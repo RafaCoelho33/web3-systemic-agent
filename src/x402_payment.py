@@ -16,6 +16,9 @@ Usage:
         parse_x402_header,
         create_eip3009_payment_header,
         build_402_response,
+        build_bazaar_discovery_extension,
+        CDPFacilitatorAuthProvider,
+        CDP_MAINNET_FACILITATOR_URL,
         usdc_to_atomic,
     )
 
@@ -45,9 +48,9 @@ for _p in (_ROOT_DIR, _SRC_DIR):
         sys.path.insert(0, _p)
 
 try:
-    from src.schemas import PaymentReceipt
+    from src.schemas import PaymentReceipt, ConditionRulePayload, FinalAgentResponse
 except ImportError:
-    from schemas import PaymentReceipt
+    from schemas import PaymentReceipt, ConditionRulePayload, FinalAgentResponse
 
 try:
     from x402 import (
@@ -60,9 +63,15 @@ try:
         PaymentPayload,
     )
     from x402.http import HTTPFacilitatorClientSync
+    from x402.http.facilitator_client_base import AuthHeaders
     from x402.mechanisms.evm.exact import (
         ExactEvmClientScheme,
         ExactEvmServerScheme,
+    )
+    from x402.extensions.bazaar import (
+        declare_discovery_extension,
+        OutputConfig,
+        bazaar_resource_server_extension,
     )
     HAS_X402_SDK = True
 except ImportError:
@@ -76,6 +85,7 @@ DEFAULT_X402_PRICE_USDC: float = 0.01
 DEFAULT_X402_NETWORK: str = "eip155:84532"  # Base Sepolia
 DEFAULT_PAY_TO_ADDRESS: str = "0x0000000000000000000000000000000000000001"
 DEFAULT_FACILITATOR_URL: str = "https://x402.org/facilitator"
+CDP_MAINNET_FACILITATOR_URL: str = "https://api.cdp.coinbase.com/platform/v2/x402"
 BASE_SEPOLIA_USDC: str = "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
 BASE_MAINNET_USDC: str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 ARBITRUM_ONE_USDC: str = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
@@ -137,6 +147,8 @@ class X402Config(BaseModel):
     facilitator_url: str = Field(default=DEFAULT_FACILITATOR_URL, description="Facilitator service URL")
     asset: str = Field(default="USDC", description="Token symbol or contract address")
     use_live_facilitator: bool = Field(default=False, description="Whether to route micropayments to a live HTTP facilitator")
+    cdp_api_key_id: Optional[str] = Field(default=None, description="Coinbase CDP API Key ID")
+    cdp_api_key_secret: Optional[str] = Field(default=None, description="Coinbase CDP API Key Secret")
 
     def __init__(self, **data: Any):
         if "enabled" not in data:
@@ -153,13 +165,40 @@ class X402Config(BaseModel):
             data["network"] = os.getenv("X402_NETWORK", DEFAULT_X402_NETWORK)
         if "pay_to_address" not in data:
             data["pay_to_address"] = os.getenv("PAY_TO_ADDRESS", DEFAULT_PAY_TO_ADDRESS)
-        if "facilitator_url" not in data:
-            data["facilitator_url"] = os.getenv("FACILITATOR_URL", DEFAULT_FACILITATOR_URL)
         if "asset" not in data:
             data["asset"] = os.getenv("X402_ASSET", "USDC")
         if "use_live_facilitator" not in data:
             env_live = os.getenv("X402_USE_LIVE_FACILITATOR", "false").strip().lower()
             data["use_live_facilitator"] = env_live in ("true", "1", "yes")
+
+        if "cdp_api_key_id" not in data:
+            raw_id = os.getenv("CDP_API_KEY_ID")
+            data["cdp_api_key_id"] = raw_id.strip() if raw_id and raw_id.strip() else None
+        elif not data["cdp_api_key_id"] or not str(data["cdp_api_key_id"]).strip():
+            data["cdp_api_key_id"] = None
+        else:
+            data["cdp_api_key_id"] = str(data["cdp_api_key_id"]).strip()
+
+        if "cdp_api_key_secret" not in data:
+            raw_secret = os.getenv("CDP_API_KEY_SECRET")
+            data["cdp_api_key_secret"] = raw_secret.strip() if raw_secret and raw_secret.strip() else None
+        elif not data["cdp_api_key_secret"] or not str(data["cdp_api_key_secret"]).strip():
+            data["cdp_api_key_secret"] = None
+        else:
+            data["cdp_api_key_secret"] = str(data["cdp_api_key_secret"]).strip()
+
+        if "facilitator_url" not in data:
+            env_fac = os.getenv("FACILITATOR_URL")
+            if env_fac:
+                data["facilitator_url"] = env_fac
+            elif (
+                data.get("network") == "eip155:8453"
+                and data.get("cdp_api_key_id")
+                and data.get("cdp_api_key_secret")
+            ):
+                data["facilitator_url"] = CDP_MAINNET_FACILITATOR_URL
+            else:
+                data["facilitator_url"] = DEFAULT_FACILITATOR_URL
 
         raw_addr = data.get("pay_to_address", DEFAULT_PAY_TO_ADDRESS)
         if Web3.is_address(raw_addr):
@@ -173,6 +212,10 @@ class X402Config(BaseModel):
         if Web3.is_address(v):
             return Web3.to_checksum_address(v)
         return v
+
+    def has_cdp_credentials(self) -> bool:
+        """Returns True if both CDP API key ID and secret are configured."""
+        return bool(self.cdp_api_key_id and self.cdp_api_key_secret)
 
     @property
     def chain_id(self) -> int:
@@ -199,6 +242,106 @@ class X402Config(BaseModel):
         if self.network in NETWORK_PROFILES:
             return bool(NETWORK_PROFILES[self.network]["is_testnet"])
         return True
+
+
+class CDPFacilitatorAuthProvider:
+    """
+    Authentication provider for Coinbase Developer Platform (CDP) x402 Facilitator.
+    Injects required Bearer authorization and CDP key ID headers across facilitator endpoints.
+    """
+
+    def __init__(self, api_key_id: str, api_key_secret: str):
+        self.api_key_id = str(api_key_id or "").strip()
+        self.api_key_secret = str(api_key_secret or "").strip()
+
+    def get_auth_headers(self) -> Any:
+        headers = {
+            "Authorization": f"Bearer {self.api_key_secret}",
+            "X-CDP-API-KEY-ID": self.api_key_id,
+        }
+        if HAS_X402_SDK:
+            try:
+                from x402.http.facilitator_client_base import AuthHeaders
+                return AuthHeaders(
+                    verify=dict(headers),
+                    settle=dict(headers),
+                    supported=dict(headers),
+                    bazaar=dict(headers),
+                )
+            except ImportError:
+                pass
+        return {
+            "verify": dict(headers),
+            "settle": dict(headers),
+            "supported": dict(headers),
+            "bazaar": dict(headers),
+        }
+
+
+def build_bazaar_discovery_extension(endpoint: str = "/evaluate") -> Dict[str, Any]:
+    """
+    Constructs an x402 Bazaar auto-discovery extension declaring input/output JSON schemas
+    and sample payloads for Agent-to-Agent discovery.
+    """
+    sample_input = {
+        "rule_id": "example-audit-01",
+        "chain_id": 8453,
+        "deterministic": {
+            "target_address": "0x4200000000000000000000000000000000000006",
+            "min_value_wei": 0,
+            "required_function_selectors": ["0xf2fde38b"],
+            "check_native_balance": False,
+        },
+        "semantic": {
+            "enabled": True,
+            "policy_prompt": "Audit transaction calldata and governance proposal for security risks",
+            "risk_threshold": 7.0,
+        },
+        "context_metadata": {
+            "calldata": "0xf2fde38b000000000000000000000000deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "proposal_description": "DAO Governance yield optimization parameter update",
+            "tx_value_wei": 0,
+        },
+    }
+    sample_output_example = {
+        "rule_id": "example-audit-01",
+        "chain_id": 8453,
+        "llm_invoked": True,
+    }
+
+    if HAS_X402_SDK:
+        try:
+            return declare_discovery_extension(
+                input=sample_input,
+                input_schema=ConditionRulePayload.model_json_schema(),
+                body_type="json",
+                output=OutputConfig(
+                    example=sample_output_example,
+                    schema=FinalAgentResponse.model_json_schema(),
+                ),
+            )
+        except Exception as exc:
+            logger.warning("Failed to generate bazaar discovery extension via SDK: %s", exc)
+
+    return {
+        "bazaar": {
+            "info": {
+                "input": {
+                    "type": "http",
+                    "bodyType": "json",
+                    "body": sample_input,
+                },
+                "output": {
+                    "type": "json",
+                    "example": sample_output_example,
+                },
+            },
+            "schema": {
+                "input": ConditionRulePayload.model_json_schema(),
+                "output": FinalAgentResponse.model_json_schema(),
+            },
+        }
+    }
 
 
 def parse_x402_header(header_value: Optional[str], default_network: Optional[str] = DEFAULT_X402_NETWORK) -> Dict[str, Any]:
@@ -359,6 +502,8 @@ def create_eip3009_payment_header(
     }
     if payload_dict.get("extensions") is not None:
         header_dict["extensions"] = payload_dict["extensions"]
+    if header_dict.get("extensions") is None:
+        header_dict["extensions"] = build_bazaar_discovery_extension("/evaluate")
 
     json_str = json.dumps(header_dict)
     if as_base64:
@@ -490,11 +635,18 @@ class HTTPX402Facilitator:
         payer_address: str,
         amount_atomic: int,
         amount_usdc: float,
+        auth_provider: Any = None,
     ) -> VerificationResult:
         try:
-            fac = HTTPFacilitatorClientSync(FacilitatorConfig(url=facilitator_url))
+            fac_cfg = FacilitatorConfig(url=facilitator_url, auth_provider=auth_provider) if auth_provider else FacilitatorConfig(url=facilitator_url)
+            fac = HTTPFacilitatorClientSync(fac_cfg)
             srv = x402ResourceServerSync(fac)
             srv.register(network, ExactEvmServerScheme())
+            if hasattr(srv, "register_extension") and HAS_X402_SDK:
+                try:
+                    srv.register_extension(bazaar_resource_server_extension)
+                except Exception as ext_err:
+                    logger.debug("Could not register bazaar extension on srv: %s", ext_err)
             srv.initialize()
 
             v = srv.verify_payment(payload_obj, req)
@@ -546,11 +698,18 @@ class HTTPX402Facilitator:
         req: Any,
         facilitator_url: str,
         network: str,
+        auth_provider: Any = None,
     ) -> SettlementResult:
         try:
-            fac = HTTPFacilitatorClientSync(FacilitatorConfig(url=facilitator_url))
+            fac_cfg = FacilitatorConfig(url=facilitator_url, auth_provider=auth_provider) if auth_provider else FacilitatorConfig(url=facilitator_url)
+            fac = HTTPFacilitatorClientSync(fac_cfg)
             srv = x402ResourceServerSync(fac)
             srv.register(network, ExactEvmServerScheme())
+            if hasattr(srv, "register_extension") and HAS_X402_SDK:
+                try:
+                    srv.register_extension(bazaar_resource_server_extension)
+                except Exception as ext_err:
+                    logger.debug("Could not register bazaar extension on srv: %s", ext_err)
             srv.initialize()
 
             s = srv.settle_payment(payload_obj, req)
@@ -646,6 +805,12 @@ class HTTPX402Facilitator:
 
             payload_obj = PaymentPayload.model_validate(payload_dict)
 
+            auth_provider = (
+                CDPFacilitatorAuthProvider(config.cdp_api_key_id, config.cdp_api_key_secret)
+                if config.has_cdp_credentials()
+                else None
+            )
+
             return await asyncio.to_thread(
                 self._verify_eip3009_sync,
                 payload_obj=payload_obj,
@@ -656,6 +821,7 @@ class HTTPX402Facilitator:
                 payer_address=payer_address,
                 amount_atomic=amount_atomic,
                 amount_usdc=amount_usdc,
+                auth_provider=auth_provider,
             )
 
         base_url = (self.facilitator_url or config.facilitator_url).rstrip("/")
@@ -665,12 +831,17 @@ class HTTPX402Facilitator:
             "required_atomic": required_atomic,
             "network": config.network,
         }
+        headers = {}
+        if config.has_cdp_credentials():
+            headers["Authorization"] = f"Bearer {config.cdp_api_key_secret}"
+            headers["X-CDP-API-KEY-ID"] = config.cdp_api_key_id
+
         try:
             if self.client is not None:
-                resp = await self.client.post(url, json=payload, timeout=self.timeout)
+                resp = await self.client.post(url, json=payload, headers=headers if headers else None, timeout=self.timeout)
             else:
                 async with httpx.AsyncClient(timeout=self.timeout) as client:
-                    resp = await client.post(url, json=payload)
+                    resp = await client.post(url, json=payload, headers=headers if headers else None)
             if resp.status_code == 200:
                 data = resp.json()
                 return VerificationResult(**data)
@@ -734,12 +905,19 @@ class HTTPX402Facilitator:
 
             payload_obj = PaymentPayload.model_validate(payload_dict)
 
+            auth_provider = (
+                CDPFacilitatorAuthProvider(config.cdp_api_key_id, config.cdp_api_key_secret)
+                if config.has_cdp_credentials()
+                else None
+            )
+
             return await asyncio.to_thread(
                 self._settle_eip3009_sync,
                 payload_obj=payload_obj,
                 req=req,
                 facilitator_url=base_url,
                 network=config.network,
+                auth_provider=auth_provider,
             )
 
         base_url = (self.facilitator_url or config.facilitator_url).rstrip("/")
@@ -749,12 +927,17 @@ class HTTPX402Facilitator:
             "required_atomic": required_atomic,
             "network": config.network,
         }
+        headers = {}
+        if config.has_cdp_credentials():
+            headers["Authorization"] = f"Bearer {config.cdp_api_key_secret}"
+            headers["X-CDP-API-KEY-ID"] = config.cdp_api_key_id
+
         try:
             if self.client is not None:
-                resp = await self.client.post(url, json=payload, timeout=self.timeout)
+                resp = await self.client.post(url, json=payload, headers=headers if headers else None, timeout=self.timeout)
             else:
                 async with httpx.AsyncClient(timeout=self.timeout) as client:
-                    resp = await client.post(url, json=payload)
+                    resp = await client.post(url, json=payload, headers=headers if headers else None)
             if resp.status_code == 200:
                 data = resp.json()
                 return SettlementResult(**data)
@@ -791,7 +974,8 @@ def build_402_response(
     reason: str = "Payment Required",
 ) -> JSONResponse:
     """
-    Constructs a compliant HTTP 402 Payment Required response containing x402 payment scheme metadata.
+    Constructs a compliant HTTP 402 Payment Required response containing x402 payment scheme metadata
+    and Bazaar auto-discovery extensions.
     """
     required_atomic = usdc_to_atomic(required_usdc)
     body = {
@@ -808,10 +992,13 @@ def build_402_response(
                 "usdcAddress": config.usdc_contract_address,
                 "payTo": config.pay_to_address,
                 "resource": endpoint,
-                "description": f"Web3 Security & Governance Audit for {endpoint}",
+                "description": f"Web3 Security & Governance Audit for {endpoint} — EVM Pre-Transaction Security Firewall, Calldata Decoder & DAO Proposal Risk Auditor (Base, Ethereum, Arbitrum, Optimism)",
+                "mimeType": "application/json",
+                "discoverable": True,
                 "extra": {"name": "USDC", "version": "2"},
             }
         ],
+        "extensions": build_bazaar_discovery_extension(endpoint),
     }
     return JSONResponse(
         status_code=402,
