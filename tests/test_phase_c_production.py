@@ -736,5 +736,144 @@ class TestPhaseCBazaarAndCDPMainnet:
         token = headers.verify["Authorization"][len("Bearer "):]
         assert len(token.split(".")) == 3
 
+    def test_cdp_jwt_signing_ed25519_48_byte_pkcs8_der(self):
+        """Generates real 48-byte PKCS#8 DER Ed25519 key, builds CDP JWT, and verifies cryptographic signature."""
+        import base64
+        import json
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        from cryptography.hazmat.primitives import serialization
+        from src.x402_payment import CDPFacilitatorAuthProvider
+
+        private_key = ed25519.Ed25519PrivateKey.generate()
+        der_bytes = private_key.private_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        assert len(der_bytes) == 48
+
+        api_key_id = "e6a4b123-4567-89ab-cdef-0123456789ab"
+        api_key_secret = base64.b64encode(der_bytes).decode("ascii")
+
+        provider = CDPFacilitatorAuthProvider(api_key_id=api_key_id, api_key_secret=api_key_secret)
+        headers = provider.get_auth_headers()
+
+        auth_header = headers.verify["Authorization"]
+        assert auth_header.startswith("Bearer ")
+        token = auth_header[len("Bearer "):]
+        jwt_parts = token.split(".")
+        assert len(jwt_parts) == 3
+
+        def _b64_url_decode(s: str) -> bytes:
+            padding = "=" * ((4 - len(s) % 4) % 4)
+            return base64.urlsafe_b64decode(s + padding)
+
+        h_b64, p_b64, s_b64 = jwt_parts
+        jwt_header = json.loads(_b64_url_decode(h_b64).decode("utf-8"))
+        jwt_payload = json.loads(_b64_url_decode(p_b64).decode("utf-8"))
+        sig_bytes = _b64_url_decode(s_b64)
+        signing_input = f"{h_b64}.{p_b64}".encode("ascii")
+
+        assert jwt_header["alg"] == "EdDSA"
+        assert jwt_header["kid"] == api_key_id
+        assert jwt_payload["sub"] == api_key_id
+        assert jwt_payload["iss"] == "cdp"
+        assert "POST api.cdp.coinbase.com/platform/v2/x402/verify" in jwt_payload["uris"]
+
+        private_key.public_key().verify(sig_bytes, signing_input)
+
+    def test_cdp_jwt_signing_ecdsa_pem_and_64_byte_raw(self):
+        """Generates CDP JWTs from 64-byte raw base64 key (EdDSA) and SECP256R1 ECDSA PEM (ES256)."""
+        import base64
+        import json
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives import serialization
+        from src.x402_payment import CDPFacilitatorAuthProvider
+
+        def _b64_url_decode(s: str) -> bytes:
+            padding = "=" * ((4 - len(s) % 4) % 4)
+            return base64.urlsafe_b64decode(s + padding)
+
+        raw_64_bytes = b"\x22" * 64
+        raw_64_b64 = base64.b64encode(raw_64_bytes).decode("ascii")
+        provider_64 = CDPFacilitatorAuthProvider(api_key_id="key-64-raw", api_key_secret=raw_64_b64)
+        headers_64 = provider_64.get_auth_headers()
+        assert headers_64.verify["Authorization"].startswith("Bearer ")
+        parts_64 = headers_64.verify["Authorization"][len("Bearer "):].split(".")
+        assert len(parts_64) == 3
+        jwt_header_64 = json.loads(_b64_url_decode(parts_64[0]).decode("utf-8"))
+        assert jwt_header_64["alg"] == "EdDSA"
+
+        ec_key = ec.generate_private_key(ec.SECP256R1())
+        pem_bytes = ec_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        provider_ec = CDPFacilitatorAuthProvider(api_key_id="key-ecdsa-pem", api_key_secret=pem_bytes.decode("ascii"))
+        headers_ec = provider_ec.get_auth_headers()
+        assert headers_ec.verify["Authorization"].startswith("Bearer ")
+        parts_ec = headers_ec.verify["Authorization"][len("Bearer "):].split(".")
+        assert len(parts_ec) == 3
+        jwt_header_ec = json.loads(_b64_url_decode(parts_ec[0]).decode("utf-8"))
+        assert jwt_header_ec["alg"] == "ES256"
+
+    @pytest.mark.asyncio
+    async def test_http_facilitator_rest_fallback_uses_signed_jwt(self):
+        """HTTPX402Facilitator REST fallback attaches signed 3-part Bearer JWT and API Key ID header."""
+        import base64
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        from cryptography.hazmat.primitives import serialization
+        from src.x402_payment import X402Config, HTTPX402Facilitator
+
+        private_key = ed25519.Ed25519PrivateKey.generate()
+        der_bytes = private_key.private_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        assert len(der_bytes) == 48
+        der_b64 = base64.b64encode(der_bytes).decode("ascii")
+
+        cfg = X402Config(
+            enabled=True,
+            network="eip155:8453",
+            cdp_api_key_id="uuid-key-1",
+            cdp_api_key_secret=der_b64,
+        )
+
+        mock_resp = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "valid": True,
+                "payment_id": "p1",
+                "payer_address": "0x1111111111111111111111111111111111111111",
+                "amount_atomic": 50000,
+                "amount_usdc": 0.05,
+            },
+        )
+        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client.post = AsyncMock(return_value=mock_resp)
+
+        facilitator = HTTPX402Facilitator(client=mock_client)
+        payment_data = {
+            "payment_id": "p1",
+            "payer_address": "0x1111111111111111111111111111111111111111",
+            "amount_atomic": 50000,
+        }
+        res = await facilitator.verify(payment_data, 50000, cfg)
+        assert res.valid is True
+
+        called_headers = mock_client.post.call_args.kwargs["headers"]
+        assert "Authorization" in called_headers
+        auth_hdr = called_headers["Authorization"]
+        assert auth_hdr.startswith("Bearer ")
+        assert auth_hdr != f"Bearer {der_b64}"
+        jwt_token = auth_hdr[len("Bearer "):]
+        parts = jwt_token.split(".")
+        assert len(parts) == 3
+        assert called_headers["X-CDP-API-KEY-ID"] == "uuid-key-1"
+
+
 
 

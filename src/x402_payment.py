@@ -264,8 +264,20 @@ class CDPFacilitatorAuthProvider:
     """
 
     def __init__(self, api_key_id: str, api_key_secret: str):
-        self.api_key_id = str(api_key_id or "").strip()
-        self.api_key_secret = str(api_key_secret or "").strip()
+        self.api_key_id = str(api_key_id or "").strip().strip("'\"")
+        self.api_key_secret = str(api_key_secret or "").strip().strip("'\"")
+        if self.api_key_secret.startswith("{") and self.api_key_secret.endswith("}"):
+            try:
+                parsed = json.loads(self.api_key_secret)
+                if isinstance(parsed, dict):
+                    self.api_key_id = self.api_key_id or str(
+                        parsed.get("id") or parsed.get("name") or parsed.get("apiKeyId") or ""
+                    ).strip()
+                    self.api_key_secret = str(
+                        parsed.get("secret") or parsed.get("privateKey") or parsed.get("apiKeySecret") or self.api_key_secret
+                    ).strip()
+            except Exception:
+                pass
 
     def _build_bearer_token(
         self,
@@ -276,7 +288,7 @@ class CDPFacilitatorAuthProvider:
         """
         Builds a Coinbase CDP signed JWT Bearer token for the given method and path.
         """
-        secret_clean = self.api_key_secret.replace("\\n", "\n").strip()
+        secret_clean = self.api_key_secret.replace("\\n", "\n").strip().strip("'\"")
         key = None
         alg = None
 
@@ -293,13 +305,31 @@ class CDPFacilitatorAuthProvider:
                 pass
         else:
             try:
-                raw = base64.b64decode("".join(secret_clean.split()), validate=True)
-                if len(raw) == 64:
-                    key = ed25519.Ed25519PrivateKey.from_private_bytes(raw[:32])
-                    alg = "EdDSA"
-                elif len(raw) == 32:
-                    key = ed25519.Ed25519PrivateKey.from_private_bytes(raw)
-                    alg = "EdDSA"
+                b64_str = "".join(secret_clean.split())
+                if len(b64_str) % 4 != 0:
+                    b64_str += "=" * ((4 - len(b64_str) % 4) % 4)
+                raw = base64.b64decode(b64_str)
+                try:
+                    loaded = serialization.load_der_private_key(raw, password=None)
+                    if isinstance(loaded, ed25519.Ed25519PrivateKey):
+                        key = loaded
+                        alg = "EdDSA"
+                    elif isinstance(loaded, ec.EllipticCurvePrivateKey):
+                        key = loaded
+                        alg = "ES256"
+                except Exception:
+                    pass
+
+                if key is None:
+                    if len(raw) == 64:
+                        key = ed25519.Ed25519PrivateKey.from_private_bytes(raw[:32])
+                        alg = "EdDSA"
+                    elif len(raw) == 32:
+                        key = ed25519.Ed25519PrivateKey.from_private_bytes(raw)
+                        alg = "EdDSA"
+                    elif len(raw) == 48:
+                        key = ed25519.Ed25519PrivateKey.from_private_bytes(raw[-32:])
+                        alg = "EdDSA"
             except Exception:
                 pass
 
@@ -940,8 +970,10 @@ class HTTPX402Facilitator:
         }
         headers = {}
         if config.has_cdp_credentials():
-            headers["Authorization"] = f"Bearer {config.cdp_api_key_secret}"
-            headers["X-CDP-API-KEY-ID"] = config.cdp_api_key_id
+            auth_provider = CDPFacilitatorAuthProvider(config.cdp_api_key_id, config.cdp_api_key_secret)
+            auth_hdrs = auth_provider.get_auth_headers()
+            verify_hdrs = auth_hdrs.verify if hasattr(auth_hdrs, "verify") else auth_hdrs.get("verify", {})
+            headers.update(verify_hdrs)
 
         try:
             if self.client is not None:
@@ -1036,8 +1068,10 @@ class HTTPX402Facilitator:
         }
         headers = {}
         if config.has_cdp_credentials():
-            headers["Authorization"] = f"Bearer {config.cdp_api_key_secret}"
-            headers["X-CDP-API-KEY-ID"] = config.cdp_api_key_id
+            auth_provider = CDPFacilitatorAuthProvider(config.cdp_api_key_id, config.cdp_api_key_secret)
+            auth_hdrs = auth_provider.get_auth_headers()
+            settle_hdrs = auth_hdrs.settle if hasattr(auth_hdrs, "settle") else auth_hdrs.get("settle", {})
+            headers.update(settle_hdrs)
 
         try:
             if self.client is not None:
