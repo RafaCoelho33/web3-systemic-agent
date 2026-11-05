@@ -60,45 +60,62 @@ O script reutilizável [`scripts/run_live_scenarios.py`](file:///C:/Users/rafae/
 
 ---
 
-## 3. Fase B4 — Carteira de Testnet e Validação Paga E2E ✅ CONCLUÍDA
+## 3. Fase B4 — Carteira de Testnet e Validação Paga E2E (Local + On-Chain) ✅ CONCLUÍDA
 
-### Resultados Obtidos
-1. **Configuração da Carteira de Recebimento:**
-   * Endereço configurado no `.env`: `PAY_TO_ADDRESS=0x2b7F1fd931f7f28f89e0f688Dd5Bb7a620c24b63`.
-   * Rede: Base Sepolia (`eip155:84532`), Ativo: `USDC`.
-2. **Script Demonstrativo do Agente Comprador ([`scripts/client_agent_x402.py`](file:///C:/Users/rafae/Desktop/Nova%20pasta/scripts/client_agent_x402.py)):**
-   * Gera carteira pagadora com par de chaves ECDSA secp256k1.
-   * Suporta modo duplo: servidor ao vivo (`--url http://127.0.0.1:8000`) ou modo embutido ASGI (executa em 1 comando sem precisar de outro terminal aberto).
-3. **Ciclo Completo Executado com Sucesso:**
-   * Chamada inicial sem pagamento $\rightarrow$ `HTTP 402 Payment Required` (exigindo `10.000` unidades atômicas = $0,01 USDC direcionados a `0x2b7F1fd931f7f28f89e0f688Dd5Bb7a620c24b63`).
-   * Assinatura criptográfica da autorização de pagamento pelo agente comprador.
-   * Reenvio com cabeçalho `X-PAYMENT` $\rightarrow$ Validação, auditoria semântica no Gemini e liquidação.
-   * Retorno `HTTP 200 OK` contendo laudo de auditoria (`REJECT`, score 9.5) e recibo `PaymentReceipt` com `tx_hash`.
-   * Ledger SQLite atualizado com receita e lucro líquido visíveis no relatório `python -m src.report`.
-   * Comando para reexecução:
-     ```powershell
-     python scripts/client_agent_x402.py
-     ```
+### Resultados Obtidos e Prova On-Chain na Base Sepolia
+1. **Configuração das Carteiras:**
+   * **Carteira de Recebimento do Agente (`PAY_TO_ADDRESS`):** `0x2b7F1fd931f7f28f89e0f688Dd5Bb7a620c24b63`
+   * **Carteira Persistente do Agente Comprador:** `0x4EbC7529d8c948ed1245A8106F2834969dbCec2b`
+   * **Facilitador Público x402 (Patrocinador de Gás):** `0xd407e409E34E0b9afb99EcCeb609bDbcD5e7f1bf` (`https://x402.org/facilitator`)
+   * **Contrato Oficial USDC (Base Sepolia):** `0x036CbD53842c5426634e7929541eC2318f3dCF7e`
+2. **Prova Imutável de Liquidação On-Chain (EIP-3009 Gasless):**
+   * **Bloco Minerado:** `54583500` (Base Sepolia, Chain ID `84532`)
+   * **Transaction Hash:** `0xa02872819cef168637efe50d917441fd196cd03b4baafc7b9ff3dc624f18fc0d`
+   * **Link Oficial no Basescan:** [https://sepolia.basescan.org/tx/0xa02872819cef168637efe50d917441fd196cd03b4baafc7b9ff3dc624f18fc0d](https://sepolia.basescan.org/tx/0xa02872819cef168637efe50d917441fd196cd03b4baafc7b9ff3dc624f18fc0d)
+   * **Histórico de Tokens da Carteira Recebedora:** [https://sepolia.basescan.org/address/0x2b7F1fd931f7f28f89e0f688Dd5Bb7a620c24b63#tokentxns](https://sepolia.basescan.org/address/0x2b7F1fd931f7f28f89e0f688Dd5Bb7a620c24b63#tokentxns)
+   * **Custo de Gás para o Comprador e para o Agente:** `0.00 ETH` (100% subsidiado pelo facilitador x402 via `transferWithAuthorization`).
+3. **Scripts Operacionais Entregues:**
+   * [`scripts/setup_buyer_wallet.py`](file:///C:/Users/rafae/Desktop/Nova%20pasta/scripts/setup_buyer_wallet.py): Gera/inspeciona a carteira compradora e consulta saldos reais de ETH e USDC na Base Sepolia.
+   * [`scripts/send_live_usdc.py`](file:///C:/Users/rafae/Desktop/Nova%20pasta/scripts/send_live_usdc.py): Assina autorização EIP-3009 gasless e liquida `0.01 USDC` on-chain via `https://x402.org/facilitator`, gravando o recibo no SQLite (`data/agent.db`).
+   * [`scripts/client_agent_x402.py`](file:///C:/Users/rafae/Desktop/Nova%20pasta/scripts/client_agent_x402.py): Demonstra o fluxo completo A2A (`HTTP 402` $\rightarrow$ assinatura ECDSA $\rightarrow$ auditoria Gemini $\rightarrow$ `HTTP 200 OK` + `PaymentReceipt`).
+4. **Comandos para Reexecução:**
+   ```powershell
+   # Inspecionar saldos on-chain da carteira compradora
+   python scripts/setup_buyer_wallet.py
+
+   # Executar pagamento real de 0.01 USDC on-chain (Gasless EIP-3009)
+   python scripts/send_live_usdc.py
+
+   # Executar ciclo completo A2A da API com auditoria Gemini
+   python scripts/client_agent_x402.py
+
+   # Exibir relatório financeiro e operacional consolidado
+   python -m src.report
+   ```
 
 ---
 
-## 4. Fase B5 — Atração de Demanda, Produção e Conectores
+## 4. Fase B5 — Atração de Demanda, Produção e Conectores ✅ CONCLUÍDA
 
-### Objetivo
-Levar o agente ao mercado, conectar a fontes reais de eventos e publicar o repositório.
+### Entregas Validadas (324 testes unitários + 11 de integração on-chain = 335 testes passando)
+1. **Conector de Governança de DAOs ([`src/governance_connector.py`](file:///C:/Users/rafae/Desktop/Nova%20pasta/src/governance_connector.py) + [`scripts/governance_listener.py`](file:///C:/Users/rafae/Desktop/Nova%20pasta/scripts/governance_listener.py)):**
+   * Integração ao vivo com a API GraphQL pública do **Snapshot** (`https://hub.snapshot.org/graphql`), consultando propostas reais de DAOs (`arbitrumfoundation.eth`, `aavedao.eth`, `ens.eth`) com fallback resiliente para propostas curadas (`--curated`).
+   * Extração heurística automática de contratos EVM e seletores de calldata (`transferOwnership`, `upgradeTo`, `transfer`) embutidos no corpo das propostas.
+   * Classificação estruturada de alertas (`CRITICAL` $\rightarrow$ `REJECT`, `WARNING` $\rightarrow$ `MANUAL_REVIEW`, `INFO` $\rightarrow$ `APPROVE`) e persistência no SQLite (`source="governance_listener"`).
+   * Novo endpoint HTTP na API: `POST /governance/audit-proposals`.
+2. **Perfis Multi-Rede e Chaveamento Automático Testnet $\leftrightarrow$ Mainnet ([`src/x402_payment.py`](file:///C:/Users/rafae/Desktop/Nova%20pasta/src/x402_payment.py)):**
+   * Registro `NETWORK_PROFILES` com resolução automática de contratos oficiais de USDC, Chain IDs e RPCs para:
+     * **Base Sepolia (`eip155:84532`):** USDC `0x036CbD53842c5426634e7929541eC2318f3dCF7e`
+     * **Base Mainnet (`eip155:8453`):** USDC `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`
+     * **Arbitrum One (`eip155:42161`):** USDC `0xaf88d065e77c8cC2239327C5EDb3A432268e5831`
+   * Fábrica `get_x402_facilitator` com suporte a `X402_USE_LIVE_FACILITATOR=true`.
+3. **Suíte de Testes e Auditoria de Segurança Git ([`src/test_phase_b5.py`](file:///C:/Users/rafae/Desktop/Nova%20pasta/src/test_phase_b5.py)):**
+   * 79 novos testes validando os perfis de rede, o conector do Snapshot, o endpoint de governança e a blindagem do Git (`git check-ignore` e `git ls-files` garantindo zero vazamento de `.env`, `.buyer_wallet.json` ou bancos `.db`).
+4. **Comandos para Execução:**
+   ```powershell
+   # Auditar propostas reais ao vivo do Snapshot com Gemini na Base Sepolia
+   python scripts/governance_listener.py --limit 3
 
-### Etapas de Implementação:
-1. **Conector de Demanda Passiva (Snapshot / Tally Listener):**
-   * Script automatizado (`scripts/governance_listener.py`) que consome webhooks/APIs públicas de governança de DAOs na Base.
-   * Avalia propostas recém-criadas e publica o resultado automaticamente (gerando visibilidade e prova social).
-2. **Migração para Mainnet:**
-   * Ajuste do Chain ID no `.env` para `8453` (Base Mainnet) e contrato oficial de USDC da Base.
-   * Configuração de credenciais de produção no facilitador (Coinbase CDP).
-3. **Controle de Versão e Documentação de Entrega:**
-   * Inicialização do repositório Git:
-     ```powershell
-     git init
-     git add .
-     git commit -m "feat: Autonomous Web3 Condition-Action Trigger Agent v1.0"
-     ```
-   * Elaboração do `README.md` completo com documentação da API para agentes externos.
+   # Auditar propostas curadas determinísticas (APPROVE, REJECT, MANUAL_REVIEW)
+   python scripts/governance_listener.py --curated
+   ```

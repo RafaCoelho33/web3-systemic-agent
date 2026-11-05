@@ -22,17 +22,57 @@ for p in (ROOT_DIR, SRC_DIR):
         sys.path.insert(0, p)
 
 try:
-    from src.api import app, create_app, HealthCheckResponse, RuleValidationResponse
+    from src.api import (
+        app,
+        create_app,
+        HealthCheckResponse,
+        RuleValidationResponse,
+        ServiceDiscoveryResponse,
+    )
     from src.task_worker import AgentWorkerPool, JobStore, JobStatus, JobRecord
     from src.storage import AgentStorage
     from src.schemas import PaymentReceipt
-    from src.x402_payment import X402Config, MockX402Facilitator
+    from src.x402_payment import (
+        X402Config,
+        MockX402Facilitator,
+        HTTPX402Facilitator,
+        get_x402_facilitator,
+        NETWORK_PROFILES,
+        get_network_profile,
+    )
+    from src.governance_connector import (
+        SnapshotGovernanceConnector,
+        GovernanceProposal,
+        GovernanceAuditReport,
+        GovernanceScanRequest,
+        get_curated_dao_proposals,
+    )
 except ImportError:
-    from api import app, create_app, HealthCheckResponse, RuleValidationResponse
+    from api import (
+        app,
+        create_app,
+        HealthCheckResponse,
+        RuleValidationResponse,
+        ServiceDiscoveryResponse,
+    )
     from task_worker import AgentWorkerPool, JobStore, JobStatus, JobRecord
     from storage import AgentStorage
     from schemas import PaymentReceipt
-    from x402_payment import X402Config, MockX402Facilitator
+    from x402_payment import (
+        X402Config,
+        MockX402Facilitator,
+        HTTPX402Facilitator,
+        get_x402_facilitator,
+        NETWORK_PROFILES,
+        get_network_profile,
+    )
+    from governance_connector import (
+        SnapshotGovernanceConnector,
+        GovernanceProposal,
+        GovernanceAuditReport,
+        GovernanceScanRequest,
+        get_curated_dao_proposals,
+    )
 
 __all__ = [
     "app",
@@ -47,6 +87,15 @@ __all__ = [
     "PaymentReceipt",
     "X402Config",
     "MockX402Facilitator",
+    "HTTPX402Facilitator",
+    "get_x402_facilitator",
+    "NETWORK_PROFILES",
+    "get_network_profile",
+    "SnapshotGovernanceConnector",
+    "GovernanceProposal",
+    "GovernanceAuditReport",
+    "GovernanceScanRequest",
+    "get_curated_dao_proposals",
 ]
 
 if __name__ == "__main__":

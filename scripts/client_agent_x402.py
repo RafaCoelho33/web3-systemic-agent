@@ -41,23 +41,24 @@ for _p in (_ROOT_DIR, _SRC_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-# 2. Load environment variables (.env)
-import dotenv
+# 2. Load environment variables (.env) when not under test harness
+if "pytest" not in sys.modules:
+    import dotenv
 
-_env_file = os.path.join(_ROOT_DIR, ".env")
-if os.path.exists(_env_file):
-    dotenv.load_dotenv(_env_file, override=False)
-dotenv.load_dotenv(override=False)
+    _env_file = os.path.join(_ROOT_DIR, ".env")
+    if os.path.exists(_env_file):
+        dotenv.load_dotenv(_env_file, override=False)
+    dotenv.load_dotenv(override=False)
 
-if hasattr(sys.stdout, "reconfigure"):
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
 
-# Configure responsive default Gemini model
-if "GEMINI_MODEL" not in os.environ:
-    os.environ["GEMINI_MODEL"] = "gemini-3.1-flash-lite"
+    # Configure responsive default Gemini model
+    if "GEMINI_MODEL" not in os.environ:
+        os.environ["GEMINI_MODEL"] = "gemini-3.5-flash-lite"
 
 from eth_account import Account
 from eth_account.messages import encode_defunct
@@ -90,11 +91,14 @@ async def setup_client_session(
         (client, is_live_mode, app_instance_if_in_process)
     """
     try:
-        live_client = httpx.AsyncClient(base_url=target_url, timeout=2.0)
-        resp = await live_client.get("/health")
-        if resp.status_code == 200:
-            return live_client, True, None
-        await live_client.aclose()
+        live_client = httpx.AsyncClient(base_url=target_url, timeout=45.0)
+        try:
+            resp = await live_client.get("/health", timeout=6.0)
+            if resp.status_code == 200:
+                return live_client, True, None
+            await live_client.aclose()
+        except Exception:
+            await live_client.aclose()
     except Exception:
         pass
 

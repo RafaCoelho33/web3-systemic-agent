@@ -10,6 +10,9 @@ Usage:
         X402Config,
         MockX402Facilitator,
         HTTPX402Facilitator,
+        get_x402_facilitator,
+        NETWORK_PROFILES,
+        get_network_profile,
         parse_x402_header,
         build_402_response,
         usdc_to_atomic,
@@ -25,7 +28,7 @@ import json
 import logging
 import os
 import sys
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Union
 import httpx
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
@@ -54,6 +57,42 @@ DEFAULT_PAY_TO_ADDRESS: str = "0x0000000000000000000000000000000000000001"
 DEFAULT_FACILITATOR_URL: str = "https://x402.org/facilitator"
 BASE_SEPOLIA_USDC: str = "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
 BASE_MAINNET_USDC: str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+ARBITRUM_ONE_USDC: str = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+
+NETWORK_PROFILES: Dict[str, Dict[str, Any]] = {
+    "eip155:84532": {
+        "chain_id": 84532,
+        "name": "Base Sepolia",
+        "is_testnet": True,
+        "usdc_address": BASE_SEPOLIA_USDC,
+        "default_rpc": "https://sepolia.base.org",
+    },
+    "eip155:8453": {
+        "chain_id": 8453,
+        "name": "Base Mainnet",
+        "is_testnet": False,
+        "usdc_address": BASE_MAINNET_USDC,
+        "default_rpc": "https://mainnet.base.org",
+    },
+    "eip155:42161": {
+        "chain_id": 42161,
+        "name": "Arbitrum One",
+        "is_testnet": False,
+        "usdc_address": ARBITRUM_ONE_USDC,
+        "default_rpc": "https://arb1.arbitrum.io/rpc",
+    },
+}
+
+
+def get_network_profile(network: str) -> Dict[str, Any]:
+    """
+    Looks up CAIP-2 network identifier in NETWORK_PROFILES.
+    Raises ValueError if unsupported. Returns a copy of the profile dictionary.
+    """
+    key = str(network or "").strip()
+    if key not in NETWORK_PROFILES:
+        raise ValueError(f"Unsupported CAIP-2 network: {network}")
+    return dict(NETWORK_PROFILES[key])
 
 
 def usdc_to_atomic(amount_usdc: float) -> int:
@@ -76,6 +115,7 @@ class X402Config(BaseModel):
     pay_to_address: str = Field(default=DEFAULT_PAY_TO_ADDRESS, description="Recipient EVM address")
     facilitator_url: str = Field(default=DEFAULT_FACILITATOR_URL, description="Facilitator service URL")
     asset: str = Field(default="USDC", description="Token symbol or contract address")
+    use_live_facilitator: bool = Field(default=False, description="Whether to route micropayments to a live HTTP facilitator")
 
     def __init__(self, **data: Any):
         if "enabled" not in data:
@@ -96,6 +136,9 @@ class X402Config(BaseModel):
             data["facilitator_url"] = os.getenv("FACILITATOR_URL", DEFAULT_FACILITATOR_URL)
         if "asset" not in data:
             data["asset"] = os.getenv("X402_ASSET", "USDC")
+        if "use_live_facilitator" not in data:
+            env_live = os.getenv("X402_USE_LIVE_FACILITATOR", "false").strip().lower()
+            data["use_live_facilitator"] = env_live in ("true", "1", "yes")
 
         raw_addr = data.get("pay_to_address", DEFAULT_PAY_TO_ADDRESS)
         if Web3.is_address(raw_addr):
@@ -109,6 +152,32 @@ class X402Config(BaseModel):
         if Web3.is_address(v):
             return Web3.to_checksum_address(v)
         return v
+
+    @property
+    def chain_id(self) -> int:
+        """Returns numeric EVM chain ID resolved from network CAIP-2 profile or string."""
+        if self.network in NETWORK_PROFILES:
+            return int(NETWORK_PROFILES[self.network]["chain_id"])
+        if self.network.startswith("eip155:"):
+            try:
+                return int(self.network.split(":")[1])
+            except (ValueError, IndexError):
+                pass
+        return 84532
+
+    @property
+    def usdc_contract_address(self) -> str:
+        """Returns active USDC contract address for the configured network."""
+        if self.network in NETWORK_PROFILES:
+            return str(NETWORK_PROFILES[self.network]["usdc_address"])
+        return BASE_SEPOLIA_USDC
+
+    @property
+    def is_testnet(self) -> bool:
+        """Returns whether the active network profile is a testnet."""
+        if self.network in NETWORK_PROFILES:
+            return bool(NETWORK_PROFILES[self.network]["is_testnet"])
+        return True
 
 
 def parse_x402_header(header_value: Optional[str], default_network: Optional[str] = DEFAULT_X402_NETWORK) -> Dict[str, Any]:
@@ -301,7 +370,13 @@ class HTTPX402Facilitator:
     Production-grade HTTP facilitator adapter communicating with a remote x402 facilitator node.
     """
 
-    def __init__(self, timeout: float = 10.0, client: Optional[httpx.AsyncClient] = None):
+    def __init__(
+        self,
+        facilitator_url: Optional[str] = None,
+        timeout: float = 10.0,
+        client: Optional[httpx.AsyncClient] = None,
+    ):
+        self.facilitator_url = facilitator_url
         self.timeout = timeout
         self.client = client
 
@@ -315,7 +390,8 @@ class HTTPX402Facilitator:
         payer_address = str(payment_data.get("payer_address", ""))
         amount_atomic = int(payment_data.get("amount_atomic", 0))
         amount_usdc = float(payment_data.get("amount_usdc", amount_atomic / (10 ** USDC_DECIMALS)))
-        url = f"{config.facilitator_url.rstrip('/')}/verify"
+        base_url = (self.facilitator_url or config.facilitator_url).rstrip("/")
+        url = f"{base_url}/verify"
         payload = {
             "payment_data": payment_data,
             "required_atomic": required_atomic,
@@ -355,7 +431,8 @@ class HTTPX402Facilitator:
         required_atomic: int,
         config: X402Config,
     ) -> SettlementResult:
-        url = f"{config.facilitator_url.rstrip('/')}/settle"
+        base_url = (self.facilitator_url or config.facilitator_url).rstrip("/")
+        url = f"{base_url}/settle"
         payload = {
             "payment_data": payment_data,
             "required_atomic": required_atomic,
@@ -380,6 +457,20 @@ class HTTPX402Facilitator:
                 settled=False,
                 error=f"Facilitator settlement connection error: {str(exc)}",
             )
+
+
+def get_x402_facilitator(
+    config: Optional[X402Config] = None,
+) -> Union[HTTPX402Facilitator, MockX402Facilitator]:
+    """
+    Returns an appropriate x402 facilitator instance based on config.
+    Returns HTTPX402Facilitator if config.use_live_facilitator is True,
+    otherwise MockX402Facilitator.
+    """
+    cfg = config or X402Config()
+    if cfg.use_live_facilitator:
+        return HTTPX402Facilitator(facilitator_url=cfg.facilitator_url)
+    return MockX402Facilitator()
 
 
 def build_402_response(

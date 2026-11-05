@@ -10,3 +10,6 @@ data/
 *.db
 *.sqlite
 *.sqlite3
+.buyer_wallet.json
+scripts/.buyer_wallet.json
+*.key

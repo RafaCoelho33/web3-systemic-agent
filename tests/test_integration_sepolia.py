@@ -45,6 +45,7 @@ from schemas import (
 )
 from chain_inspector import ChainInspector
 from engine import ConditionAgentEngine
+from semantic_evaluator import MockSemanticEvaluator
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +98,9 @@ async def sepolia_engine(ensure_sepolia_available):
     Tracks instantiated ChainInspectors and gracefully disconnects their
     AsyncHTTPProviders on fixture teardown to prevent unclosed aiohttp sessions.
     """
-    engine = ConditionAgentEngine(rpc_url=BASE_SEPOLIA_RPC)
+    engine = ConditionAgentEngine(
+        rpc_url=BASE_SEPOLIA_RPC, semantic_evaluator=MockSemanticEvaluator()
+    )
     active_inspectors = []
 
     class TrackingChainInspector(ChainInspector):

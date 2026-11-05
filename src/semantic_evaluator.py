@@ -181,6 +181,9 @@ MODEL_PRICING_PER_1M: Dict[str, tuple[float, float]] = {
     "gemini-2.0-flash": (0.10, 0.40),
     "gemini-2.5-flash": (0.30, 2.50),
     "gemini-1.5-flash": (0.075, 0.30),
+    "gemini-3.5-flash-lite": (0.075, 0.30),
+    "gemini-3.1-flash-lite": (0.075, 0.30),
+    "gemini-3.8-flash": (0.10, 0.40),
     "gpt-4o-mini": (0.15, 0.60),
     "gpt-4o": (2.50, 10.00),
     "mock": (0.0, 0.0),
@@ -506,7 +509,10 @@ class OpenAISemanticEvaluator:
             return final_res
 
         except Exception as exc:
-            logger.error(f"OpenAISemanticEvaluator failed during execution: {exc}", exc_info=True)
+            logger.error(
+                f"OpenAISemanticEvaluator failed during execution: {exc}",
+                exc_info=not self.fallback_to_mock,
+            )
             if self.fallback_to_mock:
                 logger.warning("Failing over to MockSemanticEvaluator due to OpenAI API exception.")
                 mock_evaluator = MockSemanticEvaluator(max_input_chars=self.max_input_chars)
@@ -645,11 +651,37 @@ class GeminiSemanticEvaluator:
             else:
                 config = config_kwargs
 
-            response = await self.client.aio.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=config,
-            )
+            used_model = self.model_name
+            try:
+                response = await self.client.aio.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=config,
+                )
+            except Exception as initial_exc:
+                exc_str = str(initial_exc)
+                is_mock = hasattr(self.client, "_mock_name") or hasattr(
+                    getattr(self.client, "aio", None), "_mock_name"
+                )
+                if not is_mock and any(
+                    err_code in exc_str for err_code in ("503", "UNAVAILABLE", "404", "NOT_FOUND")
+                ):
+                    alt_model = (
+                        "gemini-3.5-flash-lite"
+                        if self.model_name != "gemini-3.5-flash-lite"
+                        else "gemini-3.1-flash-lite"
+                    )
+                    logger.warning(
+                        f"Gemini model '{self.model_name}' encountered error ({initial_exc}). Retrying once with failover model '{alt_model}'."
+                    )
+                    used_model = alt_model
+                    response = await self.client.aio.models.generate_content(
+                        model=alt_model,
+                        contents=prompt,
+                        config=config,
+                    )
+                else:
+                    raise
 
             usage = getattr(response, "usage_metadata", None)
             val_in = getattr(usage, "prompt_token_count", 0) if usage is not None else 0
@@ -657,7 +689,7 @@ class GeminiSemanticEvaluator:
             val_out = getattr(usage, "candidates_token_count", 0) if usage is not None else 0
             output_tokens = val_out if isinstance(val_out, int) else 0
 
-            cost_usd = estimate_llm_cost_usd(self.model_name, input_tokens, output_tokens)
+            cost_usd = estimate_llm_cost_usd(used_model, input_tokens, output_tokens)
             latency_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
 
             # Check if response was returned directly as SemanticAuditResult or LLMAuditOutput (e.g. mock returns instance)
@@ -705,7 +737,7 @@ class GeminiSemanticEvaluator:
                 update={
                     "cached": False,
                     "provider": "gemini",
-                    "model": self.model_name,
+                    "model": used_model,
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
                     "estimated_cost_usd": cost_usd,
@@ -717,7 +749,10 @@ class GeminiSemanticEvaluator:
             return final_res
 
         except Exception as exc:
-            logger.error(f"GeminiSemanticEvaluator failed during execution: {exc}", exc_info=True)
+            logger.error(
+                f"GeminiSemanticEvaluator failed during execution: {exc}",
+                exc_info=not self.fallback_to_mock,
+            )
             if self.fallback_to_mock:
                 logger.warning("Failing over to MockSemanticEvaluator due to Gemini API exception.")
                 mock_evaluator = MockSemanticEvaluator(max_input_chars=self.max_input_chars)

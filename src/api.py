@@ -50,9 +50,20 @@ try:
     from src.x402_payment import (
         X402Config,
         MockX402Facilitator,
+        HTTPX402Facilitator,
+        get_x402_facilitator,
+        NETWORK_PROFILES,
+        get_network_profile,
         parse_x402_header,
         build_402_response,
         usdc_to_atomic,
+    )
+    from src.governance_connector import (
+        SnapshotGovernanceConnector,
+        GovernanceProposal,
+        GovernanceAuditReport,
+        GovernanceScanRequest,
+        get_curated_dao_proposals,
     )
 except ImportError:
     from schemas import (
@@ -74,9 +85,20 @@ except ImportError:
     from x402_payment import (
         X402Config,
         MockX402Facilitator,
+        HTTPX402Facilitator,
+        get_x402_facilitator,
+        NETWORK_PROFILES,
+        get_network_profile,
         parse_x402_header,
         build_402_response,
         usdc_to_atomic,
+    )
+    from governance_connector import (
+        SnapshotGovernanceConnector,
+        GovernanceProposal,
+        GovernanceAuditReport,
+        GovernanceScanRequest,
+        get_curated_dao_proposals,
     )
 
 logger = logging.getLogger(__name__)
@@ -101,6 +123,17 @@ def get_batch_max_items() -> int:
 # -------------------------------------------------------------------------
 # API Response Schemas
 # -------------------------------------------------------------------------
+
+class ServiceDiscoveryResponse(BaseModel):
+    service: str = Field(default="Web3 Condition-Action Trigger Agent", description="Service identifier")
+    version: str = Field(default="1.0.0", description="Application semantic version")
+    status: str = Field(default="online", description="Operational status of the service")
+    x402_enabled: bool = Field(default=False, description="Whether x402 payment gate is enabled")
+    x402_network: Optional[str] = Field(default=None, description="Active x402 CAIP-2 network")
+    price_per_eval_usdc: float = Field(default=0.01, description="Base price in USDC per evaluation")
+    pay_to_address: Optional[str] = Field(default=None, description="Recipient EVM address for x402 micropayments")
+    endpoints: Dict[str, str] = Field(..., description="Canonical API endpoint route registry")
+
 
 class HealthCheckResponse(BaseModel):
     status: str = Field(..., description="Overall health status: 'ok', 'degraded', or 'error'")
@@ -185,7 +218,7 @@ def create_app(
     active_engine = engine if engine is not None else ConditionAgentEngine()
     active_storage = storage or getattr(active_engine, "storage", None) or AgentStorage()
     active_x402_config = x402_config if x402_config is not None else X402Config()
-    active_facilitator = facilitator if facilitator is not None else MockX402Facilitator()
+    active_facilitator = facilitator if facilitator is not None else get_x402_facilitator(active_x402_config)
 
     app.state.engine = active_engine
     app.state.storage = active_storage
@@ -277,6 +310,47 @@ def create_app(
     # ---------------------------------------------------------------------
     # Endpoints
     # ---------------------------------------------------------------------
+
+    @app.get(
+        "/",
+        response_model=ServiceDiscoveryResponse,
+        tags=["Monitoring"],
+        summary="Service Discovery and Root Status",
+    )
+    async def root():
+        """
+        Root discovery endpoint returning active service status, x402 payment gate configuration,
+        and canonical API endpoint routes.
+        """
+        x402_cfg: X402Config = getattr(app.state, "x402_config", None) or X402Config()
+        return {
+            "service": "Web3 Condition-Action Trigger Agent",
+            "version": "1.0.0",
+            "status": "online",
+            "x402_enabled": x402_cfg.enabled,
+            "x402_network": x402_cfg.network,
+            "price_per_eval_usdc": x402_cfg.price_per_eval_usdc,
+            "pay_to_address": x402_cfg.pay_to_address,
+            "endpoints": {
+                "swagger_docs": "/docs",
+                "health": "/health",
+                "validate_rule": "/rules/validate",
+                "evaluate": "/evaluate",
+                "evaluate_batch": "/rules/evaluate-batch",
+                "enqueue_job": "/rules/enqueue",
+                "governance_audit": "/governance/audit-proposals",
+                "metrics_summary": "/metrics/summary",
+                "payments_ledger": "/payments",
+                "error_logs": "/logs/errors",
+            },
+        }
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def favicon():
+        """
+        Silent favicon handler returning 204 No Content to avoid browser 404 noise.
+        """
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.get("/health", response_model=HealthCheckResponse, tags=["Monitoring"])
     async def health_check():
@@ -977,6 +1051,27 @@ def create_app(
                 detail="Storage not configured on application state",
             )
         return await storage_inst.get_payments(limit=limit, payer_address=payer_address)
+
+    @app.post(
+        "/governance/audit-proposals",
+        response_model=List[GovernanceAuditReport],
+        tags=["Governance"],
+        summary="Audit recent DAO governance proposals via Snapshot GraphQL or curated dataset",
+    )
+    async def audit_governance_proposals(
+        req: Optional[GovernanceScanRequest] = None,
+    ) -> List[GovernanceAuditReport]:
+        """
+        Audits recent DAO governance proposals for security risks, privilege escalations,
+        and discrepancies using Snapshot or curated proposals.
+        """
+        scan_req = req or GovernanceScanRequest()
+        connector = SnapshotGovernanceConnector(default_chain_id=scan_req.chain_id)
+        return await connector.audit_proposals(
+            engine=app.state.engine,
+            spaces=scan_req.spaces,
+            limit=scan_req.limit,
+        )
 
     return app
 
