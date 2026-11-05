@@ -39,6 +39,7 @@ try:
         SnapshotGovernanceConnector,
         GovernanceProposal,
         GovernanceAuditReport,
+        WebhookAlertDispatcher,
         get_curated_dao_proposals,
     )
     from src.report import generate_report, format_report_text
@@ -50,6 +51,7 @@ except ImportError:
         SnapshotGovernanceConnector,
         GovernanceProposal,
         GovernanceAuditReport,
+        WebhookAlertDispatcher,
         get_curated_dao_proposals,
     )
     from report import generate_report, format_report_text
@@ -96,6 +98,9 @@ async def run_listener(
     limit: int = 3,
     curated: bool = False,
     spaces: Optional[List[str]] = None,
+    webhook_url: Optional[str] = None,
+    public_api_url: Optional[str] = None,
+    min_alert_level: str = "WARNING",
 ) -> int:
     """
     Executes governance listener scan on Base Sepolia.
@@ -119,6 +124,12 @@ async def run_listener(
 
     print(f"[+] Successfully audited {len(reports)} proposals.")
     print_audit_table(reports)
+
+    active_webhook = webhook_url or os.getenv("ALERT_WEBHOOK_URL")
+    if active_webhook:
+        dispatcher = WebhookAlertDispatcher(webhook_url=active_webhook, public_api_url=public_api_url)
+        sent_count = await dispatcher.dispatch_batch(reports, min_alert_level=min_alert_level)
+        print(f"[+] Dispatched {sent_count} webhook alert(s) (min_level={min_alert_level}).")
 
     print("=" * 60)
     print("OPERATIONAL & FINANCIAL LEDGER METRICS")
@@ -151,10 +162,36 @@ def main() -> None:
         dest="spaces",
         help="Snapshot space identifier (e.g. 'arbitrumfoundation.eth'). Can be specified multiple times.",
     )
+    parser.add_argument(
+        "--webhook-url",
+        type=str,
+        default=None,
+        help="Optional Discord/Slack/HTTP webhook URL for threat notifications",
+    )
+    parser.add_argument(
+        "--public-url",
+        type=str,
+        default=None,
+        help="Public API base URL included in x402 alert links",
+    )
+    parser.add_argument(
+        "--min-alert-level",
+        type=str,
+        default="WARNING",
+        choices=["INFO", "WARNING", "CRITICAL"],
+        help="Minimum alert severity to trigger webhook dispatch (default: WARNING)",
+    )
 
     args = parser.parse_args()
     exit_code = asyncio.run(
-        run_listener(limit=args.limit, curated=args.curated, spaces=args.spaces)
+        run_listener(
+            limit=args.limit,
+            curated=args.curated,
+            spaces=args.spaces,
+            webhook_url=args.webhook_url,
+            public_api_url=args.public_url,
+            min_alert_level=args.min_alert_level,
+        )
     )
     sys.exit(exit_code)
 

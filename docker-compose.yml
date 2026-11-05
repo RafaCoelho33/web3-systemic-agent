@@ -1,0 +1,23 @@
+services:
+  web3-trigger-agent:
+    build: .
+    container_name: web3-trigger-agent
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - LEDGER_DB_PATH=/app/data/agent.db
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.5-flash-lite}
+      - X402_ENABLED=${X402_ENABLED:-true}
+      - X402_NETWORK=${X402_NETWORK:-eip155:84532}
+      - X402_PRICE_EVALUATE=${X402_PRICE_EVALUATE:-0.01}
+      - X402_USE_LIVE_FACILITATOR=${X402_USE_LIVE_FACILITATOR:-false}
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

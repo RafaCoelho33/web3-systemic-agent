@@ -10,6 +10,8 @@ Usage:
         GovernanceProposal,
         GovernanceAuditReport,
         GovernanceScanRequest,
+        WebhookAlertDispatcher,
+        ALERT_SEVERITY_ORDER,
         get_curated_dao_proposals,
         extract_onchain_hints,
     )
@@ -60,6 +62,12 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 DEFAULT_TARGET_ADDRESS: str = "0x4200000000000000000000000000000000000006"
+
+ALERT_SEVERITY_ORDER: Dict[str, int] = {
+    "INFO": 1,
+    "WARNING": 2,
+    "CRITICAL": 3,
+}
 
 
 class GovernanceProposal(BaseModel):
@@ -401,3 +409,140 @@ class SnapshotGovernanceConnector:
             )
 
         return reports
+
+
+class WebhookAlertDispatcher:
+    """
+    Dispatches automated governance security alerts to external webhooks
+    (Discord, Slack, or generic HTTP endpoints) with x402 monetization links.
+    """
+
+    def __init__(
+        self,
+        webhook_url: Optional[str] = None,
+        public_api_url: Optional[str] = None,
+        price_usdc: float = 0.01,
+        timeout: float = 10.0,
+        client: Optional[httpx.AsyncClient] = None,
+    ):
+        self.webhook_url = (webhook_url or os.getenv("ALERT_WEBHOOK_URL") or "").strip() or None
+        self.public_api_url = (public_api_url or os.getenv("PUBLIC_API_URL") or "http://localhost:8000").rstrip("/")
+        self.price_usdc = price_usdc
+        self.timeout = timeout
+        self.client = client
+
+    def format_alert_payload(self, report: GovernanceAuditReport) -> Dict[str, Any]:
+        """
+        Formats a governance audit report into Discord/Slack/generic compatible JSON payload
+        with x402 monetization links.
+        """
+        prop = report.proposal
+        sem = report.agent_response.semantic_Evaluation
+        decision = sem.recommended_action if sem else "SKIPPED"
+        risk_score = sem.risk_score if sem else 0.0
+        summary = sem.summary if sem else "Stage 1 filtered"
+        flagged = list(sem.flagged_issues) if sem else []
+
+        audit_endpoint = f"{self.public_api_url}/evaluate"
+        content_text = (
+            f"🚨 **GOVERNANCE SECURITY ALERT [{report.alert_level}]** 🚨\n"
+            f"• **Space**: `{prop.space_id}`\n"
+            f"• **Title**: {prop.title}\n"
+            f"• **Decision**: `{decision}` (Risk Score: {risk_score:.1f})\n"
+            f"• **Target Address**: `{prop.target_address}`\n"
+            f"• **Summary**: {summary}\n"
+            f"💳 **x402 Monetized Audit**: `{audit_endpoint}` (${self.price_usdc:.4f} USDC)"
+        )
+
+        color_map = {
+            "CRITICAL": 0xFF0000,
+            "WARNING": 0xFFA500,
+            "INFO": 0x3498DB,
+        }
+        embed_color = color_map.get(report.alert_level, 0x808080)
+
+        embeds = [
+            {
+                "title": f"[{report.alert_level}] {prop.space_id}: {prop.title[:100]}",
+                "description": summary[:1000] if summary else "",
+                "color": embed_color,
+                "fields": [
+                    {"name": "Decision", "value": str(decision), "inline": True},
+                    {"name": "Risk Score", "value": f"{risk_score:.1f}", "inline": True},
+                    {"name": "Target Address", "value": str(prop.target_address), "inline": False},
+                    {
+                        "name": "Flagged Issues",
+                        "value": "\n".join(f"- {i}" for i in flagged) if flagged else "None",
+                        "inline": False,
+                    },
+                    {
+                        "name": "x402 Paid Audit",
+                        "value": f"{audit_endpoint} (${self.price_usdc:.4f} USDC)",
+                        "inline": False,
+                    },
+                ],
+            }
+        ]
+
+        return {
+            "content": content_text,
+            "text": content_text,
+            "embeds": embeds,
+            "alert_level": report.alert_level,
+            "proposal_id": prop.proposal_id,
+            "space_id": prop.space_id,
+            "decision": decision,
+            "risk_score": risk_score,
+            "flagged_issues": flagged,
+            "x402_audit_endpoint": audit_endpoint,
+            "price_usdc": self.price_usdc,
+        }
+
+    async def dispatch_alert(self, report: GovernanceAuditReport) -> bool:
+        """
+        Sends formatted alert payload to webhook URL.
+        Returns True on HTTP 2xx, False otherwise without raising unhandled exceptions.
+        """
+        if not self.webhook_url:
+            return False
+
+        payload = self.format_alert_payload(report)
+        try:
+            if self.client:
+                resp = await self.client.post(self.webhook_url, json=payload)
+            else:
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    resp = await client.post(self.webhook_url, json=payload)
+
+            if 200 <= resp.status_code < 300:
+                return True
+            else:
+                logger.warning(
+                    f"Webhook dispatch failed with HTTP {resp.status_code}: {resp.text}"
+                )
+                return False
+        except Exception as exc:
+            logger.warning(f"Webhook dispatch exception: {exc}")
+            return False
+
+    async def dispatch_batch(
+        self,
+        reports: List[GovernanceAuditReport],
+        min_alert_level: str = "WARNING",
+    ) -> int:
+        """
+        Dispatches alerts for all reports meeting or exceeding min_alert_level.
+        Returns the count of successfully delivered webhook requests.
+        """
+        min_order = ALERT_SEVERITY_ORDER.get(min_alert_level.upper(), 2)
+        matching_reports = [
+            r for r in reports
+            if ALERT_SEVERITY_ORDER.get(r.alert_level, 0) >= min_order
+        ]
+        sent_count = 0
+        for r in matching_reports:
+            success = await self.dispatch_alert(r)
+            if success:
+                sent_count += 1
+        return sent_count
+

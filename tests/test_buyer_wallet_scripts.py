@@ -420,6 +420,86 @@ class TestClientAgentX402Session:
                 assert fallback is not None
                 assert fallback.address.startswith("0x")
 
+    @pytest.mark.asyncio
+    async def test_setup_client_session_force_in_process(self):
+        """Verifies force_in_process=True initializes in-process app directly without network probing."""
+        import httpx
+        from scripts.client_agent_x402 import setup_client_session
+
+        with patch.object(httpx.AsyncClient, "get", new_callable=AsyncMock) as mock_probe_get:
+            client, is_live, app = await setup_client_session("http://127.0.0.1:8000", force_in_process=True)
+            try:
+                assert is_live is False
+                assert app is not None
+                mock_probe_get.assert_not_called()
+                assert client.timeout.read is not None
+                assert client.timeout.read >= 30.0
+            finally:
+                await client.aclose()
+
+    def test_fetch_live_contract_transaction_success(self):
+        """Scans mocked blocks and extracts authentic smart contract transaction with calldata."""
+        from web3 import Web3 as RealWeb3
+        from scripts.client_agent_x402 import fetch_live_contract_transaction
+
+        with patch("scripts.client_agent_x402.Web3") as mock_w3_cls:
+            mock_w3 = MagicMock()
+            mock_w3_cls.return_value = mock_w3
+            mock_w3_cls.HTTPProvider = MagicMock()
+            mock_w3_cls.to_checksum_address.side_effect = RealWeb3.to_checksum_address
+            mock_w3.is_connected.return_value = True
+            mock_w3.eth.block_number = 100
+
+            # 4 Transactions to test filtering
+            # Tx 1: contract creation (to=None) -> skipped
+            tx1 = {"to": None, "input": "0x"}
+            # Tx 2: empty calldata -> skipped
+            tx2 = {"to": "0x1111111111111111111111111111111111111111", "input": "0x"}
+            # Tx 3: EOA transfer with code b"" -> skipped
+            tx3 = {"to": "0x2222222222222222222222222222222222222222", "input": "0xa9059cbb00000000"}
+            # Tx 4: Contract call with code b"\x60\x80" -> match!
+            tx4 = {
+                "to": "0x4200000000000000000000000000000000000006",
+                "from": "0x3333333333333333333333333333333333333333",
+                "input": "0xa9059cbb0000000000000000",
+                "value": 500,
+                "hash": bytes.fromhex("ab" * 32),
+            }
+
+            mock_block = MagicMock()
+            mock_block.transactions = [tx1, tx2, tx3, tx4]
+            mock_w3.eth.get_block.return_value = mock_block
+
+            def mock_get_code(addr):
+                if "2222" in str(addr):
+                    return b""
+                return b"\x60\x80"
+
+            mock_w3.eth.get_code.side_effect = mock_get_code
+
+            result = fetch_live_contract_transaction()
+            assert result is not None
+            assert result["selector"] == "0xa9059cbb"
+            assert result["value_wei"] == 500
+            assert result["block_number"] == 100
+            assert result["tx_hash"] == "0x" + "ab" * 32
+            assert result["target_address"] == "0x4200000000000000000000000000000000000006"
+            assert result["from_address"] == "0x3333333333333333333333333333333333333333"
+            assert result["calldata"] == "0xa9059cbb0000000000000000"
+
+    def test_fetch_live_contract_transaction_rpc_offline_returns_none(self):
+        """Returns None gracefully when candidate Web3 RPC endpoints are unreachable."""
+        from scripts.client_agent_x402 import fetch_live_contract_transaction
+
+        with patch("scripts.client_agent_x402.Web3") as mock_w3_cls:
+            mock_w3 = MagicMock()
+            mock_w3_cls.return_value = mock_w3
+            mock_w3_cls.HTTPProvider = MagicMock()
+            mock_w3.is_connected.return_value = False
+
+            result = fetch_live_contract_transaction()
+            assert result is None
+
 
 class TestEIP3009APIIntegration:
     """
