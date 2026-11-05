@@ -716,4 +716,25 @@ class TestPhaseCBazaarAndCDPMainnet:
         assert headers.verify["X-CDP-API-KEY-ID"] == "cdp-key-id-123"
         assert "Bearer cdp-secret-xyz" in headers.settle["Authorization"]
 
+    def test_cdp_jwt_signing_ed25519_and_mainnet_url_override(self, monkeypatch):
+        """Generates valid Ed25519 signed JWT for CDP and overrides FACILITATOR_URL on Base Mainnet."""
+        import base64
+        from src.x402_payment import X402Config, CDPFacilitatorAuthProvider
+
+        ed25519_b64 = base64.b64encode(b"\x11" * 32).decode("ascii")
+        monkeypatch.setenv("CDP_API_KEY_ID", "organizations/org-1/apiKeys/key-1")
+        monkeypatch.setenv("CDP_API_KEY_SECRET", ed25519_b64)
+        monkeypatch.setenv("FACILITATOR_URL", "https://x402.org/facilitator")
+
+        cfg = X402Config(enabled=True, network="eip155:8453")
+        assert cfg.facilitator_url == "https://api.cdp.coinbase.com/platform/v2/x402"
+
+        provider = CDPFacilitatorAuthProvider(cfg.cdp_api_key_id, cfg.cdp_api_key_secret)
+        headers = provider.get_auth_headers()
+
+        assert headers.verify["Authorization"].startswith("Bearer ")
+        token = headers.verify["Authorization"][len("Bearer "):]
+        assert len(token.split(".")) == 3
+
+
 

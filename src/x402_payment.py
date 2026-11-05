@@ -32,9 +32,13 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import sys
+import time
 from typing import Dict, Any, Optional, Union
 import httpx
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, utils
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 from web3 import Web3
@@ -187,18 +191,26 @@ class X402Config(BaseModel):
         else:
             data["cdp_api_key_secret"] = str(data["cdp_api_key_secret"]).strip()
 
+        is_mainnet_cdp = (
+            data.get("network") == "eip155:8453"
+            and bool(data.get("cdp_api_key_id"))
+            and bool(data.get("cdp_api_key_secret"))
+        )
+
         if "facilitator_url" not in data:
             env_fac = os.getenv("FACILITATOR_URL")
-            if env_fac:
+            if is_mainnet_cdp:
+                if not env_fac or env_fac.rstrip("/") == DEFAULT_FACILITATOR_URL.rstrip("/"):
+                    data["facilitator_url"] = CDP_MAINNET_FACILITATOR_URL
+                else:
+                    data["facilitator_url"] = env_fac
+            elif env_fac:
                 data["facilitator_url"] = env_fac
-            elif (
-                data.get("network") == "eip155:8453"
-                and data.get("cdp_api_key_id")
-                and data.get("cdp_api_key_secret")
-            ):
-                data["facilitator_url"] = CDP_MAINNET_FACILITATOR_URL
             else:
                 data["facilitator_url"] = DEFAULT_FACILITATOR_URL
+        else:
+            if is_mainnet_cdp and str(data.get("facilitator_url", "")).rstrip("/") == DEFAULT_FACILITATOR_URL.rstrip("/"):
+                data["facilitator_url"] = CDP_MAINNET_FACILITATOR_URL
 
         raw_addr = data.get("pay_to_address", DEFAULT_PAY_TO_ADDRESS)
         if Web3.is_address(raw_addr):
@@ -247,34 +259,129 @@ class X402Config(BaseModel):
 class CDPFacilitatorAuthProvider:
     """
     Authentication provider for Coinbase Developer Platform (CDP) x402 Facilitator.
-    Injects required Bearer authorization and CDP key ID headers across facilitator endpoints.
+    Generates required Bearer JWT (EdDSA / ES256) and CDP key ID headers across facilitator endpoints.
+    Falls back gracefully to raw bearer token when api_key_secret is not a cryptographic key.
     """
 
     def __init__(self, api_key_id: str, api_key_secret: str):
         self.api_key_id = str(api_key_id or "").strip()
         self.api_key_secret = str(api_key_secret or "").strip()
 
+    def _build_bearer_token(
+        self,
+        method: str,
+        path: str,
+        host: str = "api.cdp.coinbase.com",
+    ) -> str:
+        """
+        Builds a Coinbase CDP signed JWT Bearer token for the given method and path.
+        """
+        secret_clean = self.api_key_secret.replace("\\n", "\n").strip()
+        key = None
+        alg = None
+
+        if secret_clean.startswith("-----BEGIN"):
+            try:
+                loaded = serialization.load_pem_private_key(secret_clean.encode("utf-8"), password=None)
+                if isinstance(loaded, ec.EllipticCurvePrivateKey):
+                    key = loaded
+                    alg = "ES256"
+                elif isinstance(loaded, ed25519.Ed25519PrivateKey):
+                    key = loaded
+                    alg = "EdDSA"
+            except Exception:
+                pass
+        else:
+            try:
+                raw = base64.b64decode("".join(secret_clean.split()), validate=True)
+                if len(raw) == 64:
+                    key = ed25519.Ed25519PrivateKey.from_private_bytes(raw[:32])
+                    alg = "EdDSA"
+                elif len(raw) == 32:
+                    key = ed25519.Ed25519PrivateKey.from_private_bytes(raw)
+                    alg = "EdDSA"
+            except Exception:
+                pass
+
+        if key is None or alg is None:
+            return f"Bearer {self.api_key_secret}"
+
+        try:
+            now = int(time.time())
+            uri_str = f"{method.upper()} {host}{path}"
+            header = {
+                "alg": alg,
+                "typ": "JWT",
+                "kid": self.api_key_id,
+                "nonce": secrets.token_hex(16),
+            }
+            payload = {
+                "iss": "cdp",
+                "sub": self.api_key_id,
+                "nbf": now,
+                "exp": now + 120,
+                "uri": uri_str,
+                "uris": [uri_str],
+            }
+
+            h_b64 = base64.urlsafe_b64encode(json.dumps(header, separators=(",", ":")).encode("utf-8")).rstrip(b"=").decode("ascii")
+            p_b64 = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8")).rstrip(b"=").decode("ascii")
+            signing_input = f"{h_b64}.{p_b64}".encode("ascii")
+
+            if isinstance(key, ed25519.Ed25519PrivateKey):
+                sig = key.sign(signing_input)
+            elif isinstance(key, ec.EllipticCurvePrivateKey):
+                der_sig = key.sign(signing_input, ec.ECDSA(hashes.SHA256()))
+                r, s = utils.decode_dss_signature(der_sig)
+                sig = r.to_bytes(32, "big") + s.to_bytes(32, "big")
+            else:
+                return f"Bearer {self.api_key_secret}"
+
+            s_b64 = base64.urlsafe_b64encode(sig).rstrip(b"=").decode("ascii")
+            return f"Bearer {h_b64}.{p_b64}.{s_b64}"
+        except Exception as exc:
+            logger.warning("CDP JWT generation failed, falling back to raw bearer: %s", exc)
+            return f"Bearer {self.api_key_secret}"
+
     def get_auth_headers(self) -> Any:
-        headers = {
-            "Authorization": f"Bearer {self.api_key_secret}",
+        verify_token = self._build_bearer_token("POST", "/platform/v2/x402/verify")
+        settle_token = self._build_bearer_token("POST", "/platform/v2/x402/settle")
+        supported_token = self._build_bearer_token("GET", "/platform/v2/x402/supported")
+        bazaar_token = self._build_bearer_token("GET", "/platform/v2/x402/discovery/resources")
+
+        verify_headers = {
+            "Authorization": verify_token,
             "X-CDP-API-KEY-ID": self.api_key_id,
         }
+        settle_headers = {
+            "Authorization": settle_token,
+            "X-CDP-API-KEY-ID": self.api_key_id,
+        }
+        supported_headers = {
+            "Authorization": supported_token,
+            "X-CDP-API-KEY-ID": self.api_key_id,
+        }
+        bazaar_headers = {
+            "Authorization": bazaar_token,
+            "X-CDP-API-KEY-ID": self.api_key_id,
+        }
+
         if HAS_X402_SDK:
             try:
                 from x402.http.facilitator_client_base import AuthHeaders
                 return AuthHeaders(
-                    verify=dict(headers),
-                    settle=dict(headers),
-                    supported=dict(headers),
-                    bazaar=dict(headers),
+                    verify=verify_headers,
+                    settle=settle_headers,
+                    supported=supported_headers,
+                    bazaar=bazaar_headers,
                 )
             except ImportError:
                 pass
         return {
-            "verify": dict(headers),
-            "settle": dict(headers),
-            "supported": dict(headers),
-            "bazaar": dict(headers),
+            "verify": verify_headers,
+            "settle": settle_headers,
+            "supported": supported_headers,
+            "bazaar": bazaar_headers,
         }
 
 
