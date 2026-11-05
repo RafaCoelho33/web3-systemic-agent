@@ -14,6 +14,7 @@ Usage:
         NETWORK_PROFILES,
         get_network_profile,
         parse_x402_header,
+        create_eip3009_payment_header,
         build_402_response,
         usdc_to_atomic,
     )
@@ -22,6 +23,7 @@ Usage:
     facilitator = MockX402Facilitator()
 """
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -46,6 +48,25 @@ try:
     from src.schemas import PaymentReceipt
 except ImportError:
     from schemas import PaymentReceipt
+
+try:
+    from x402 import (
+        x402ClientSync,
+        x402ResourceServerSync,
+        ResourceConfig,
+        FacilitatorConfig,
+        PaymentRequirements,
+        PaymentRequired,
+        PaymentPayload,
+    )
+    from x402.http import HTTPFacilitatorClientSync
+    from x402.mechanisms.evm.exact import (
+        ExactEvmClientScheme,
+        ExactEvmServerScheme,
+    )
+    HAS_X402_SDK = True
+except ImportError:
+    HAS_X402_SDK = False
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +204,7 @@ class X402Config(BaseModel):
 def parse_x402_header(header_value: Optional[str], default_network: Optional[str] = DEFAULT_X402_NETWORK) -> Dict[str, Any]:
     """
     Parses an X-PAYMENT or PAYMENT-SIGNATURE header containing raw JSON or base64-encoded JSON.
+    Supports both legacy flat headers and nested x402 v2 EIP-3009 payload envelopes.
     Normalizes aliases and validates required fields: payment_id, payer_address, amount_atomic, and signature.
     """
     if not header_value or not isinstance(header_value, str) or not header_value.strip():
@@ -209,17 +231,21 @@ def parse_x402_header(header_value: Optional[str], default_network: Optional[str
     if not isinstance(data, dict):
         raise ValueError("Payment header must encode a JSON object")
 
-    payment_id = data.get("payment_id") or data.get("nonce") or data.get("id")
+    payload_dict = data.get("payload") if isinstance(data.get("payload"), dict) else {}
+    auth_dict = payload_dict.get("authorization") if isinstance(payload_dict.get("authorization"), dict) else {}
+    accepted_dict = data.get("accepted") if isinstance(data.get("accepted"), dict) else {}
+
+    payment_id = data.get("payment_id") or data.get("nonce") or data.get("id") or auth_dict.get("nonce")
     if not payment_id or not str(payment_id).strip():
         raise ValueError("Missing payment_id or nonce")
     payment_id = str(payment_id).strip()
 
-    payer = data.get("payer_address") or data.get("payer") or data.get("from")
+    payer = data.get("payer_address") or data.get("payer") or data.get("from") or auth_dict.get("from")
     if not payer or not isinstance(payer, str) or not Web3.is_address(payer):
         raise ValueError(f"Invalid or missing payer address: {payer}")
     payer_address = Web3.to_checksum_address(payer)
 
-    signature = data.get("signature")
+    signature = data.get("signature") or payload_dict.get("signature")
     if not signature or not isinstance(signature, str) or not signature.strip():
         raise ValueError("Missing signature in payment header")
     signature = signature.strip()
@@ -229,6 +255,10 @@ def parse_x402_header(header_value: Optional[str], default_network: Optional[str
         amount_atomic = data.get("value")
     if amount_atomic is None:
         amount_atomic = data.get("amount")
+    if amount_atomic is None:
+        amount_atomic = auth_dict.get("value")
+    if amount_atomic is None:
+        amount_atomic = accepted_dict.get("amount")
 
     if amount_atomic is None and "amount_usdc" in data:
         amount_atomic = usdc_to_atomic(float(data["amount_usdc"]))
@@ -248,7 +278,7 @@ def parse_x402_header(header_value: Optional[str], default_network: Optional[str
         raise ValueError("Payment amount cannot be negative")
 
     amount_usdc = float(data.get("amount_usdc", amount_atomic / (10 ** USDC_DECIMALS)))
-    network = data.get("network") or default_network
+    network = data.get("network") or accepted_dict.get("network") or default_network
 
     result = {
         "payment_id": payment_id,
@@ -259,12 +289,81 @@ def parse_x402_header(header_value: Optional[str], default_network: Optional[str
         "network": network,
     }
 
-    # Pass through additional context fields (e.g. simulate_settle_error)
+    # Pass through additional context fields (e.g. simulate_settle_error, payload, accepted, x402Version)
     for k, v in data.items():
         if k not in result:
             result[k] = v
 
     return result
+
+
+def create_eip3009_payment_header(
+    account: Any,
+    pay_to_address: str,
+    amount_atomic: int,
+    network: str = DEFAULT_X402_NETWORK,
+    usdc_address: Optional[str] = None,
+    as_base64: bool = False,
+) -> str:
+    """
+    Constructs an EIP-712 / EIP-3009 transferWithAuthorization signed payment header dictionary
+    using the official x402 SDK (ExactEvmClientScheme) in < 5ms without requiring network calls.
+    Returns JSON string (or Base64-encoded JSON if as_base64=True).
+    """
+    if not HAS_X402_SDK:
+        raise RuntimeError("x402 SDK is required to create EIP-3009 payment headers")
+
+    checksum_pay_to = Web3.to_checksum_address(pay_to_address)
+    token_address = usdc_address
+    if not token_address:
+        try:
+            profile = get_network_profile(network)
+            token_address = profile["usdc_address"]
+        except Exception:
+            token_address = BASE_SEPOLIA_USDC
+    checksum_token = Web3.to_checksum_address(token_address)
+
+    cli = x402ClientSync()
+    cli.register(network, ExactEvmClientScheme(account))
+
+    req = PaymentRequirements(
+        scheme="exact",
+        network=network,
+        asset=checksum_token,
+        amount=str(amount_atomic),
+        pay_to=checksum_pay_to,
+        max_timeout_seconds=300,
+        extra={"name": "USDC", "version": "2"},
+    )
+    payment_required = PaymentRequired(x402_version=2, accepts=[req])
+    payload_obj = cli.create_payment_payload(payment_required)
+    payload_dict = payload_obj.model_dump()
+
+    auth = payload_dict.get("payload", {}).get("authorization", {})
+    sig = payload_dict.get("payload", {}).get("signature", "")
+    payment_id = auth.get("nonce", "")
+    payer_address = Web3.to_checksum_address(auth.get("from", getattr(account, "address", "")))
+    amount = int(auth.get("value", amount_atomic))
+    amount_usdc = atomic_to_usdc(amount)
+
+    header_dict = {
+        "x402Version": payload_dict.get("x402Version", 2),
+        "payment_id": payment_id,
+        "payer_address": payer_address,
+        "amount_atomic": amount,
+        "amount_usdc": amount_usdc,
+        "network": network,
+        "signature": sig,
+        "payload": payload_dict.get("payload"),
+        "accepted": payload_dict.get("accepted"),
+    }
+    if payload_dict.get("extensions") is not None:
+        header_dict["extensions"] = payload_dict["extensions"]
+
+    json_str = json.dumps(header_dict)
+    if as_base64:
+        return base64.b64encode(json_str.encode("utf-8")).decode("utf-8")
+    return json_str
 
 
 class VerificationResult(BaseModel):
@@ -368,6 +467,7 @@ class MockX402Facilitator:
 class HTTPX402Facilitator:
     """
     Production-grade HTTP facilitator adapter communicating with a remote x402 facilitator node.
+    Supports both standard HTTP REST facilitator endpoints and EIP-3009 on-chain settlement via x402 SDK.
     """
 
     def __init__(
@@ -380,6 +480,106 @@ class HTTPX402Facilitator:
         self.timeout = timeout
         self.client = client
 
+    def _verify_eip3009_sync(
+        self,
+        payload_obj: Any,
+        req: Any,
+        facilitator_url: str,
+        network: str,
+        payment_id: str,
+        payer_address: str,
+        amount_atomic: int,
+        amount_usdc: float,
+    ) -> VerificationResult:
+        try:
+            fac = HTTPFacilitatorClientSync(FacilitatorConfig(url=facilitator_url))
+            srv = x402ResourceServerSync(fac)
+            srv.register(network, ExactEvmServerScheme())
+            srv.initialize()
+
+            v = srv.verify_payment(payload_obj, req)
+            is_valid = getattr(v, "is_valid", False)
+            if hasattr(v, "verify") and hasattr(v.verify, "is_valid"):
+                is_valid = bool(v.verify.is_valid)
+
+            if is_valid:
+                return VerificationResult(
+                    valid=True,
+                    reason=None,
+                    payment_id=payment_id,
+                    payer_address=payer_address,
+                    amount_atomic=amount_atomic,
+                    amount_usdc=amount_usdc,
+                )
+            else:
+                invalid_reason = (
+                    getattr(v, "invalid_reason", None)
+                    or (getattr(v.verify, "invalid_reason", None) if hasattr(v, "verify") else None)
+                    or "Payment verification rejected"
+                )
+                invalid_msg = (
+                    getattr(v, "invalid_message", None)
+                    or (getattr(v.verify, "invalid_message", None) if hasattr(v, "verify") else None)
+                )
+                reason_str = f"{invalid_reason}: {invalid_msg}" if invalid_msg else str(invalid_reason)
+                return VerificationResult(
+                    valid=False,
+                    reason=reason_str,
+                    payment_id=payment_id,
+                    payer_address=payer_address,
+                    amount_atomic=amount_atomic,
+                    amount_usdc=amount_usdc,
+                )
+        except Exception as exc:
+            return VerificationResult(
+                valid=False,
+                reason=f"Facilitator verification connection error: {str(exc)}",
+                payment_id=payment_id,
+                payer_address=payer_address,
+                amount_atomic=amount_atomic,
+                amount_usdc=amount_usdc,
+            )
+
+    def _settle_eip3009_sync(
+        self,
+        payload_obj: Any,
+        req: Any,
+        facilitator_url: str,
+        network: str,
+    ) -> SettlementResult:
+        try:
+            fac = HTTPFacilitatorClientSync(FacilitatorConfig(url=facilitator_url))
+            srv = x402ResourceServerSync(fac)
+            srv.register(network, ExactEvmServerScheme())
+            srv.initialize()
+
+            s = srv.settle_payment(payload_obj, req)
+            settle_success = getattr(s, "success", False)
+            if not settle_success and hasattr(s, "settle"):
+                settle_success = getattr(s.settle, "success", False)
+
+            if not settle_success:
+                err_reason = getattr(s, "error_reason", "unknown")
+                err_msg = getattr(s, "error_message", "Unknown settlement error")
+                return SettlementResult(
+                    settled=False,
+                    error=f"{err_reason}: {err_msg}",
+                )
+
+            tx_hash = (
+                getattr(s, "transaction", None)
+                or (getattr(s.settle, "transaction", None) if hasattr(s, "settle") else None)
+            )
+            return SettlementResult(
+                settled=True,
+                tx_hash=tx_hash,
+            )
+        except Exception as exc:
+            return SettlementResult(
+                settled=False,
+                error=f"Facilitator settlement error: {str(exc)}",
+            )
+
     async def verify(
         self,
         payment_data: Dict[str, Any],
@@ -390,6 +590,74 @@ class HTTPX402Facilitator:
         payer_address = str(payment_data.get("payer_address", ""))
         amount_atomic = int(payment_data.get("amount_atomic", 0))
         amount_usdc = float(payment_data.get("amount_usdc", amount_atomic / (10 ** USDC_DECIMALS)))
+
+        is_eip3009 = (
+            self.client is None
+            and HAS_X402_SDK
+            and isinstance(payment_data.get("payload"), dict)
+            and "authorization" in payment_data["payload"]
+        )
+
+        if is_eip3009:
+            if amount_atomic < required_atomic:
+                return VerificationResult(
+                    valid=False,
+                    reason=f"Insufficient payment amount: {amount_atomic} < {required_atomic}",
+                    payment_id=payment_id,
+                    payer_address=payer_address,
+                    amount_atomic=amount_atomic,
+                    amount_usdc=amount_usdc,
+                )
+
+            net = payment_data.get("network")
+            if net and net != config.network:
+                return VerificationResult(
+                    valid=False,
+                    reason="Network mismatch",
+                    payment_id=payment_id,
+                    payer_address=payer_address,
+                    amount_atomic=amount_atomic,
+                    amount_usdc=amount_usdc,
+                )
+
+            base_url = (self.facilitator_url or config.facilitator_url).rstrip("/")
+            accepted_data = payment_data.get("accepted")
+            if isinstance(accepted_data, dict):
+                req = PaymentRequirements.model_validate(accepted_data)
+            else:
+                req = PaymentRequirements(
+                    scheme="exact",
+                    network=config.network,
+                    asset=config.usdc_contract_address,
+                    amount=str(amount_atomic),
+                    pay_to=config.pay_to_address,
+                    max_timeout_seconds=300,
+                    extra={"name": "USDC", "version": "2"},
+                )
+
+            payload_dict = {
+                "x402Version": payment_data.get("x402Version", 2),
+                "payload": payment_data["payload"],
+            }
+            if isinstance(accepted_data, dict):
+                payload_dict["accepted"] = accepted_data
+            else:
+                payload_dict["accepted"] = req.model_dump(by_alias=True)
+
+            payload_obj = PaymentPayload.model_validate(payload_dict)
+
+            return await asyncio.to_thread(
+                self._verify_eip3009_sync,
+                payload_obj=payload_obj,
+                req=req,
+                facilitator_url=base_url,
+                network=config.network,
+                payment_id=payment_id,
+                payer_address=payer_address,
+                amount_atomic=amount_atomic,
+                amount_usdc=amount_usdc,
+            )
+
         base_url = (self.facilitator_url or config.facilitator_url).rstrip("/")
         url = f"{base_url}/verify"
         payload = {
@@ -431,6 +699,49 @@ class HTTPX402Facilitator:
         required_atomic: int,
         config: X402Config,
     ) -> SettlementResult:
+        is_eip3009 = (
+            self.client is None
+            and HAS_X402_SDK
+            and isinstance(payment_data.get("payload"), dict)
+            and "authorization" in payment_data["payload"]
+        )
+
+        if is_eip3009:
+            base_url = (self.facilitator_url or config.facilitator_url).rstrip("/")
+            accepted_data = payment_data.get("accepted")
+            if isinstance(accepted_data, dict):
+                req = PaymentRequirements.model_validate(accepted_data)
+            else:
+                amount_atomic = int(payment_data.get("amount_atomic", required_atomic))
+                req = PaymentRequirements(
+                    scheme="exact",
+                    network=config.network,
+                    asset=config.usdc_contract_address,
+                    amount=str(amount_atomic),
+                    pay_to=config.pay_to_address,
+                    max_timeout_seconds=300,
+                    extra={"name": "USDC", "version": "2"},
+                )
+
+            payload_dict = {
+                "x402Version": payment_data.get("x402Version", 2),
+                "payload": payment_data["payload"],
+            }
+            if isinstance(accepted_data, dict):
+                payload_dict["accepted"] = accepted_data
+            else:
+                payload_dict["accepted"] = req.model_dump(by_alias=True)
+
+            payload_obj = PaymentPayload.model_validate(payload_dict)
+
+            return await asyncio.to_thread(
+                self._settle_eip3009_sync,
+                payload_obj=payload_obj,
+                req=req,
+                facilitator_url=base_url,
+                network=config.network,
+            )
+
         base_url = (self.facilitator_url or config.facilitator_url).rstrip("/")
         url = f"{base_url}/settle"
         payload = {
@@ -494,9 +805,11 @@ def build_402_response(
                 "maxAmountRequired": str(required_atomic),
                 "amount_usdc": round(required_usdc, 6),
                 "asset": config.asset,
+                "usdcAddress": config.usdc_contract_address,
                 "payTo": config.pay_to_address,
                 "resource": endpoint,
                 "description": f"Web3 Security & Governance Audit for {endpoint}",
+                "extra": {"name": "USDC", "version": "2"},
             }
         ],
     }

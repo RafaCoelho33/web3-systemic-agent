@@ -66,9 +66,28 @@ import httpx
 
 from src.api import create_app
 from src.report import format_report_text
+try:
+    from src.x402_payment import create_eip3009_payment_header
+except ImportError:
+    from x402_payment import create_eip3009_payment_header
 
 # Canonical Base Sepolia contract for testing
 DEFAULT_TARGET_CONTRACT = "0x4200000000000000000000000000000000000006"
+
+
+def load_persistent_buyer_wallet() -> Account:
+    """Loads persistent buyer wallet from scripts/.buyer_wallet.json if present, or creates a transient keypair."""
+    wallet_path = os.path.join(_CURRENT_DIR, ".buyer_wallet.json")
+    if os.path.exists(wallet_path):
+        try:
+            with open(wallet_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            private_key = data.get("private_key")
+            if private_key:
+                return Account.from_key(private_key)
+        except Exception:
+            pass
+    return Account.create()
 
 
 def print_banner(title: str) -> None:
@@ -111,13 +130,19 @@ async def setup_client_session(
     return asgi_client, False, in_process_app
 
 
-async def run_x402_client_lifecycle(server_url: str, target_contract: str) -> None:
+async def run_x402_client_lifecycle(
+    server_url: str,
+    target_contract: str,
+    live_onchain: bool = False,
+) -> None:
     """Executes the full end-to-end x402 A2A client demonstration."""
+    if live_onchain:
+        os.environ["X402_USE_LIVE_FACILITATOR"] = "true"
 
     # -------------------------------------------------------------------------
     # Initialization: Keypair & Session Setup
     # -------------------------------------------------------------------------
-    buyer_account = Account.create()
+    buyer_account = load_persistent_buyer_wallet()
     client, is_live, app_instance = await setup_client_session(server_url)
 
     mode_label = (
@@ -131,6 +156,7 @@ async def run_x402_client_lifecycle(server_url: str, target_contract: str) -> No
     print(f"  Buyer AI Agent Wallet: {buyer_account.address}")
     print("  Key Cryptography     : secp256k1 EVM ECDSA Keypair")
     print(f"  Target Contract      : {target_contract} (Base Sepolia)")
+    print(f"  Live On-Chain Settle : {live_onchain}")
 
     try:
         # ---------------------------------------------------------------------
@@ -234,32 +260,26 @@ async def run_x402_client_lifecycle(server_url: str, target_contract: str) -> No
         # ---------------------------------------------------------------------
         # Step 4: Buyer AI Agent Signs EVM Payment Payload
         # ---------------------------------------------------------------------
-        print_banner("[Step 4] Buyer AI Agent Signs EVM Micropayment Payload")
-        payment_id = f"pay-{uuid.uuid4().hex}"
-
-        # Sign canonical payment challenge: {payment_id}:{payer}:{amount_atomic}:{network}
-        sign_message_text = f"{payment_id}:{buyer_account.address}:{req_atomic}:{req_network}"
-        signable_message = encode_defunct(text=sign_message_text)
-        signed_struct = buyer_account.sign_message(signable_message)
-        sig_hex = signed_struct.signature.hex()
-        if not sig_hex.startswith("0x"):
-            sig_hex = "0x" + sig_hex
-
-        payment_header_dict = {
-            "payment_id": payment_id,
-            "payer_address": buyer_account.address,
-            "amount_atomic": req_atomic,
-            "network": req_network,
-            "signature": sig_hex,
-        }
-        payment_header_json = json.dumps(payment_header_dict)
+        print_banner("[Step 4] Buyer AI Agent Signs EIP-3009 Gasless Micropayment Payload")
+        payment_header_json = create_eip3009_payment_header(
+            account=buyer_account,
+            pay_to_address=req_pay_to,
+            amount_atomic=req_atomic,
+            network=req_network,
+        )
+        payment_header_dict = json.loads(payment_header_json)
+        payment_id = payment_header_dict.get("payment_id")
+        auth_struct = payment_header_dict.get("payload", {}).get("authorization", {})
+        sig_hex = payment_header_dict.get("signature", "")
 
         print(f"  Payment ID (Nonce)   : {payment_id}")
         print(f"  Payer Address        : {buyer_account.address}")
+        print(f"  Recipient PayTo      : {auth_struct.get('to', req_pay_to)}")
         print(f"  Amount (Atomic)      : {req_atomic} atomic ({req_usdc} USDC)")
-        print(f"  Network CAIP-2       : {req_network}")
-        print(f"  Signed Digest Text   : '{sign_message_text}'")
-        print(f"  ECDSA Signature      : {sig_hex[:34]}...{sig_hex[-16:]}")
+        print(f"  Valid After          : {auth_struct.get('validAfter', '0')}")
+        print(f"  Valid Before         : {auth_struct.get('validBefore', 'N/A')}")
+        print(f"  Settlement Network   : {req_network}")
+        print(f"  EIP-712 Signature    : {sig_hex[:34]}...{sig_hex[-16:] if len(sig_hex) > 50 else sig_hex}")
 
         # ---------------------------------------------------------------------
         # Step 5: Retry POST /evaluate with X-PAYMENT Header
@@ -312,6 +332,8 @@ async def run_x402_client_lifecycle(server_url: str, target_contract: str) -> No
         print(f"  Amount Settled       : ${receipt_usdc:.4f} USDC")
         print(f"  Settlement Tx Hash   : {receipt_tx_hash}")
         print(f"  Settled Timestamp    : {settled_at}")
+        if receipt_tx_hash and receipt_tx_hash != "N/A" and (live_onchain or receipt_tx_hash.startswith("0x")):
+            print(f"  Verify on Basescan   : https://sepolia.basescan.org/tx/{receipt_tx_hash}")
 
         # Check response header receipt
         header_receipt = resp_200.headers.get("X-PAYMENT-RESPONSE") or resp_200.headers.get("PAYMENT-RESPONSE")
@@ -380,10 +402,20 @@ def main() -> None:
         default=DEFAULT_TARGET_CONTRACT,
         help=f"Target EVM contract address on Base Sepolia (default: {DEFAULT_TARGET_CONTRACT})",
     )
+    parser.add_argument(
+        "--live-onchain",
+        action="store_true",
+        default=False,
+        help="Use funded buyer wallet from scripts/.buyer_wallet.json and settle real gasless USDC on Base Sepolia via x402 facilitator",
+    )
     args = parser.parse_args()
 
     asyncio.run(
-        run_x402_client_lifecycle(server_url=args.url, target_contract=args.contract)
+        run_x402_client_lifecycle(
+            server_url=args.url,
+            target_contract=args.contract,
+            live_onchain=args.live_onchain,
+        )
     )
 
 
