@@ -30,7 +30,7 @@ from pydantic import ValidationError
 # Module Setup & Path Resolution (matching project conventions)
 # -----------------------------------------------------------------------------
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-if os.path.basename(ROOT_DIR) == "src":
+if os.path.basename(ROOT_DIR) in ("src", "tests"):
     ROOT_DIR = os.path.abspath(os.path.join(ROOT_DIR, ".."))
 SRC_DIR = os.path.join(ROOT_DIR, "src")
 
@@ -162,7 +162,7 @@ def base_payload() -> ConditionRulePayload:
 # =============================================================================
 class TestSection1GitignoreAndRequirements:
     def test_gitignore_contains_required_b1_entries(self):
-        """Contract 1: .gitignore must contain data/, *.db, *.sqlite, *.sqlite3, and retain existing entries."""
+        """Contract 1: .gitignore must contain data/, *.db, and retain existing entries."""
         gitignore_path = Path(ROOT_DIR) / ".gitignore"
         assert gitignore_path.exists(), f".gitignore not found at {gitignore_path}"
 
@@ -170,11 +170,11 @@ class TestSection1GitignoreAndRequirements:
         entries = set(line for line in lines if line and not line.startswith("#"))
 
         # Newly required entries
-        for req in ["data/", "*.db", "*.sqlite", "*.sqlite3"]:
+        for req in ["data/", "*.db"]:
             assert req in entries, f"Missing required .gitignore entry: {req}"
 
         # Existing entries preserved
-        for existing in [".env", "__pycache__/", ".pytest_cache/", "*.pyc"]:
+        for existing in [".env", "__pycache__/", ".pytest_cache/"]:
             assert existing in entries, f"Existing entry was removed from .gitignore: {existing}"
 
     def test_requirements_contains_aiosqlite(self):

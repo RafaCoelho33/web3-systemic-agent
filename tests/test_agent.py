@@ -6,9 +6,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from web3.exceptions import Web3Exception
 from pydantic import ValidationError
 
-# Setup module search paths so tests can be run from workspace root or from src/
+# Setup module search paths so tests can be run from workspace root, tests/, or src/
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-if os.path.basename(ROOT_DIR) == "src":
+if os.path.basename(ROOT_DIR) in ("src", "tests"):
     ROOT_DIR = os.path.abspath(os.path.join(ROOT_DIR, ".."))
 SRC_DIR = os.path.join(ROOT_DIR, "src")
 

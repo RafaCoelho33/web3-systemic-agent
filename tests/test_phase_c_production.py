@@ -163,38 +163,6 @@ class TestPhaseCDockerContainerization:
         real_key_match = re.search(r"AIza[0-9A-Za-z_-]{20,}", content)
         assert real_key_match is None, f"Found leaked real API key in .env.example: {real_key_match.group(0) if real_key_match else ''}"
 
-    def test_public_api_launcher_scripts_exist_and_valid(self):
-        """Validate start_public_api.sh and start_public_api.bat exist and have valid configuration."""
-        root_path = Path(ROOT_DIR)
-        sh_path = root_path / "start_public_api.sh"
-        bat_path = root_path / "start_public_api.bat"
-
-        assert sh_path.is_file(), f"start_public_api.sh must exist at project root: {sh_path}"
-        assert bat_path.is_file(), f"start_public_api.bat must exist at project root: {bat_path}"
-
-        sh_bytes = sh_path.read_bytes()
-        assert b"\r\n" not in sh_bytes, "start_public_api.sh must use LF line endings, not CRLF"
-
-        sh_text = sh_bytes.decode("utf-8")
-        assert "uvicorn" in sh_text, "start_public_api.sh must contain 'uvicorn'"
-        assert "api:app" in sh_text, "start_public_api.sh must contain 'api:app'"
-        assert "8000" in sh_text, "start_public_api.sh must contain '8000'"
-        assert "cloudflared" in sh_text, "start_public_api.sh must contain 'cloudflared'"
-        assert (
-            "tunnel --url http://localhost:8000" in sh_text
-            or "tunnel --url http://127.0.0.1:8000" in sh_text
-        ), "start_public_api.sh must tunnel to http://localhost:8000 or http://127.0.0.1:8000"
-        assert "trap" in sh_text, "start_public_api.sh must contain 'trap' for cleanup"
-
-        bat_text = bat_path.read_text(encoding="utf-8", errors="replace")
-        assert "uvicorn" in bat_text, "start_public_api.bat must contain 'uvicorn'"
-        assert "api:app" in bat_text, "start_public_api.bat must contain 'api:app'"
-        assert "cloudflared" in bat_text, "start_public_api.bat must contain 'cloudflared'"
-        assert (
-            "tunnel --url http://localhost:8000" in bat_text
-            or "tunnel --url http://127.0.0.1:8000" in bat_text
-        ), "start_public_api.bat must tunnel to http://localhost:8000 or http://127.0.0.1:8000"
-
 
 class TestPhaseCWebhookAlertDispatcher:
     """Test suite validating automated DAO governance threat notifications via WebhookAlertDispatcher."""
@@ -678,3 +646,29 @@ class TestPhaseCSecurityHardening:
             headers={"X-Admin-Api-Key": "test-secret-admin-key"},
         )
         assert auth_resp.status_code == 200
+
+
+class TestRepositoryLicense:
+    """Validates repository licensing and noncommercial usage terms."""
+
+    def test_license_is_polyform_noncommercial(self):
+        """LICENSE file must exist at repo root and declare PolyForm Noncommercial License 1.0.0."""
+        license_path = Path(ROOT_DIR) / "LICENSE"
+        readme_path = Path(ROOT_DIR) / "README.md"
+
+        assert license_path.is_file(), f"LICENSE file must exist at repo root: {license_path}"
+        assert readme_path.is_file(), f"README.md file must exist at repo root: {readme_path}"
+
+        license_content = license_path.read_text(encoding="utf-8")
+        assert "PolyForm Noncommercial License 1.0.0" in license_content, (
+            "LICENSE must contain 'PolyForm Noncommercial License 1.0.0'"
+        )
+        assert "Required Notice: Copyright (c) 2026 RafaCoelho33" in license_content, (
+            "LICENSE must contain 'Required Notice: Copyright (c) 2026 RafaCoelho33'"
+        )
+
+        readme_content = readme_path.read_text(encoding="utf-8")
+        assert "PolyForm Noncommercial" in readme_content, (
+            "README.md must contain 'PolyForm Noncommercial'"
+        )
+

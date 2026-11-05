@@ -19,10 +19,10 @@ from web3 import Web3
 from web3.exceptions import Web3Exception
 
 # -----------------------------------------------------------------------------
-# Module Setup & Path Resolution (conforming to src/test_agent.py style)
+# Module Setup & Path Resolution (conforming to test_agent.py style)
 # -----------------------------------------------------------------------------
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-if os.path.basename(ROOT_DIR) == "src":
+if os.path.basename(ROOT_DIR) in ("src", "tests"):
     ROOT_DIR = os.path.abspath(os.path.join(ROOT_DIR, ".."))
 SRC_DIR = os.path.join(ROOT_DIR, "src")
 
@@ -128,7 +128,7 @@ def base_valid_payload():
 # =============================================================================
 class TestC1Gitignore:
     def test_c1_gitignore_contains_required_entries(self):
-        """Contract C1: .gitignore must contain .env, __pycache__/, .pytest_cache/, *.pyc."""
+        """Contract C1: .gitignore must contain .env, __pycache__/, .pytest_cache/."""
         gitignore_path = Path(ROOT_DIR) / ".gitignore"
         assert gitignore_path.exists(), f".gitignore not found at {gitignore_path}"
 
@@ -136,7 +136,7 @@ class TestC1Gitignore:
         # Strip comments and empties
         entries = set(line for line in lines if line and not line.startswith("#"))
 
-        required = [".env", "__pycache__/", ".pytest_cache/", "*.pyc"]
+        required = [".env", "__pycache__/", ".pytest_cache/"]
         for req in required:
             assert req in entries, f"Missing required .gitignore entry: {req}"
 
@@ -920,11 +920,19 @@ class TestHygiene:
         assert "not integration" in content, "pytest.ini addopts must filter out integration tests: -m 'not integration'"
 
     def test_hygiene_requirements_txt_exists_and_contains_deps(self):
-        """Contract Hygiene: requirements.txt exists with >= dependencies matching installed ones."""
+        """Contract Hygiene: requirements.txt contains runtime deps and requirements-dev.txt contains dev deps."""
         req_path = Path(ROOT_DIR) / "requirements.txt"
         assert req_path.exists(), "requirements.txt does not exist at project root"
 
         content = req_path.read_text(encoding="utf-8")
-        expected_pkgs = ["web3", "pydantic", "fastapi", "uvicorn", "pytest", "pytest-asyncio"]
-        for pkg in expected_pkgs:
+        expected_runtime_pkgs = ["web3", "pydantic", "fastapi", "uvicorn"]
+        for pkg in expected_runtime_pkgs:
             assert pkg in content, f"Expected {pkg} in requirements.txt"
+
+        dev_req_path = Path(ROOT_DIR) / "requirements-dev.txt"
+        assert dev_req_path.exists(), "requirements-dev.txt does not exist at project root"
+        dev_content = dev_req_path.read_text(encoding="utf-8")
+        assert "-r requirements.txt" in dev_content, "requirements-dev.txt must reference -r requirements.txt"
+        expected_dev_pkgs = ["pytest", "pytest-asyncio"]
+        for pkg in expected_dev_pkgs:
+            assert pkg in dev_content, f"Expected {pkg} in requirements-dev.txt"

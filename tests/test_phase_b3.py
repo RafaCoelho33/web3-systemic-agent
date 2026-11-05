@@ -44,7 +44,7 @@ from web3 import Web3
 # Module Setup & Path Resolution (matching project conventions)
 # -----------------------------------------------------------------------------
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-if os.path.basename(ROOT_DIR) == "src":
+if os.path.basename(ROOT_DIR) in ("src", "tests"):
     ROOT_DIR = os.path.abspath(os.path.join(ROOT_DIR, ".."))
 SRC_DIR = os.path.join(ROOT_DIR, "src")
 
@@ -207,12 +207,19 @@ class TestSection1Requirements:
         assert any("x402" in l for l in x402_lines)
 
     def test_requirements_preserves_existing_dependencies(self):
-        """Contract 1: requirements.txt must preserve all existing package requirements."""
+        """Contract 1: requirements.txt preserves runtime deps, requirements-dev.txt contains test deps and references requirements.txt."""
         req_path = Path(ROOT_DIR) / "requirements.txt"
         assert req_path.exists()
         content = req_path.read_text(encoding="utf-8").lower()
-        for expected in ["web3", "pydantic", "fastapi", "uvicorn", "httpx", "aiosqlite", "pytest"]:
-            assert expected in content, f"Pre-existing dependency '{expected}' was removed from requirements.txt"
+        for expected in ["web3", "pydantic", "fastapi", "uvicorn", "httpx", "aiosqlite"]:
+            assert expected in content, f"Pre-existing runtime dependency '{expected}' was removed from requirements.txt"
+
+        dev_req_path = Path(ROOT_DIR) / "requirements-dev.txt"
+        assert dev_req_path.exists(), "requirements-dev.txt not found"
+        dev_content = dev_req_path.read_text(encoding="utf-8").lower()
+        assert "-r requirements.txt" in dev_content, "requirements-dev.txt must reference -r requirements.txt"
+        for dev_expected in ["pytest", "pytest-asyncio"]:
+            assert dev_expected in dev_content, f"Dev dependency '{dev_expected}' missing from requirements-dev.txt"
 
 
 # =============================================================================

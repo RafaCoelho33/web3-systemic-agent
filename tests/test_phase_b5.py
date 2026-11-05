@@ -8,7 +8,7 @@ Covers every section of the Phase B5 Specification Contract:
    proposal_to_rule_payload, and audit_proposals via ConditionAgentEngine).
 3. FastAPI POST /governance/audit-proposals endpoint and api.py re-exports.
 4. Git and Repository Security Audit (.gitignore rules, git ls-files clean of secrets,
-   existence of README.md, CONTEXT.md, PROXIMOS_PASSOS.md, scripts/governance_listener.py).
+   existence of README.md, scripts/governance_listener.py).
 """
 
 import ast
@@ -31,7 +31,7 @@ from web3 import Web3
 # Module Setup & Path Resolution (matching project conventions)
 # -----------------------------------------------------------------------------
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-if os.path.basename(ROOT_DIR) == "src":
+if os.path.basename(ROOT_DIR) in ("src", "tests"):
     ROOT_DIR = os.path.abspath(os.path.join(ROOT_DIR, ".."))
 SRC_DIR = os.path.join(ROOT_DIR, "src")
 
@@ -1020,6 +1020,8 @@ class TestSection4GitAndRepositorySecurity:
         violations = []
         for f in tracked_files:
             clean_f = f.strip().lower()
+            if os.path.basename(clean_f) == ".env.example":
+                continue
             if any(sub in clean_f for sub in sensitive_substrings):
                 violations.append(f)
             elif any(clean_f.endswith(ext) for ext in sensitive_extensions):
@@ -1028,7 +1030,7 @@ class TestSection4GitAndRepositorySecurity:
         assert len(violations) == 0, f"Sensitive files tracked in git: {violations}"
 
     def test_documentation_files_exist_and_non_empty(self):
-        required_docs = ["README.md", "CONTEXT.md", "PROXIMOS_PASSOS.md"]
+        required_docs = ["README.md"]
         for doc in required_docs:
             p = Path(ROOT_DIR) / doc
             assert p.is_file(), f"Expected documentation file {doc} to exist"

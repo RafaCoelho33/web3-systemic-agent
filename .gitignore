@@ -1,15 +1,42 @@
-env
-.gemini/*
-CONTEXT.md
-GEMINI.md
+# Environment & Secrets
 .env
-__pycache__/
-.pytest_cache/
-*.pyc
-data/
-*.db
-*.sqlite
-*.sqlite3
+.env.*
+!.env.example
 .buyer_wallet.json
 scripts/.buyer_wallet.json
 *.key
+*.pem
+
+# Python & Virtual Environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Databases & Local Data
+data/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+
+# Editor & OS Artifacts
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Internal Agent & Playbook Docs
+.gemini/
+CONTEXT.md
+GEMINI.md
+PROXIMOS_PASSOS.md
