@@ -17,11 +17,12 @@ import os
 import sys
 from typing import List, Optional
 
-try:
-    import dotenv
-    dotenv.load_dotenv(override=False)
-except ImportError:
-    pass
+if "pytest" not in sys.modules:
+    try:
+        import dotenv
+        dotenv.load_dotenv(override=False)
+    except ImportError:
+        pass
 
 # Ensure module search paths support running directly or as a package
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))

@@ -14,6 +14,7 @@ services:
       - X402_NETWORK=${X402_NETWORK:-eip155:84532}
       - X402_PRICE_EVALUATE=${X402_PRICE_EVALUATE:-0.01}
       - X402_USE_LIVE_FACILITATOR=${X402_USE_LIVE_FACILITATOR:-false}
+      - PUBLIC_EVALUATE_ONLY=${PUBLIC_EVALUATE_ONLY:-true}
     volumes:
       - ./data:/app/data
     healthcheck:

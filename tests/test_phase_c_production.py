@@ -32,6 +32,7 @@ import pytest
 # Ensure repo root and source paths are accessible
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT_DIR = os.path.abspath(os.path.join(_CURRENT_DIR, ".."))
+ROOT_DIR = _ROOT_DIR
 _SRC_DIR = os.path.join(_ROOT_DIR, "src")
 _SCRIPTS_DIR = os.path.join(_ROOT_DIR, "scripts")
 for _p in (_ROOT_DIR, _SRC_DIR, _SCRIPTS_DIR):
@@ -161,6 +162,38 @@ class TestPhaseCDockerContainerization:
         # Assert no real Gemini API key is leaked (AIza followed by 20+ chars)
         real_key_match = re.search(r"AIza[0-9A-Za-z_-]{20,}", content)
         assert real_key_match is None, f"Found leaked real API key in .env.example: {real_key_match.group(0) if real_key_match else ''}"
+
+    def test_public_api_launcher_scripts_exist_and_valid(self):
+        """Validate start_public_api.sh and start_public_api.bat exist and have valid configuration."""
+        root_path = Path(ROOT_DIR)
+        sh_path = root_path / "start_public_api.sh"
+        bat_path = root_path / "start_public_api.bat"
+
+        assert sh_path.is_file(), f"start_public_api.sh must exist at project root: {sh_path}"
+        assert bat_path.is_file(), f"start_public_api.bat must exist at project root: {bat_path}"
+
+        sh_bytes = sh_path.read_bytes()
+        assert b"\r\n" not in sh_bytes, "start_public_api.sh must use LF line endings, not CRLF"
+
+        sh_text = sh_bytes.decode("utf-8")
+        assert "uvicorn" in sh_text, "start_public_api.sh must contain 'uvicorn'"
+        assert "api:app" in sh_text, "start_public_api.sh must contain 'api:app'"
+        assert "8000" in sh_text, "start_public_api.sh must contain '8000'"
+        assert "cloudflared" in sh_text, "start_public_api.sh must contain 'cloudflared'"
+        assert (
+            "tunnel --url http://localhost:8000" in sh_text
+            or "tunnel --url http://127.0.0.1:8000" in sh_text
+        ), "start_public_api.sh must tunnel to http://localhost:8000 or http://127.0.0.1:8000"
+        assert "trap" in sh_text, "start_public_api.sh must contain 'trap' for cleanup"
+
+        bat_text = bat_path.read_text(encoding="utf-8", errors="replace")
+        assert "uvicorn" in bat_text, "start_public_api.bat must contain 'uvicorn'"
+        assert "api:app" in bat_text, "start_public_api.bat must contain 'api:app'"
+        assert "cloudflared" in bat_text, "start_public_api.bat must contain 'cloudflared'"
+        assert (
+            "tunnel --url http://localhost:8000" in bat_text
+            or "tunnel --url http://127.0.0.1:8000" in bat_text
+        ), "start_public_api.bat must tunnel to http://localhost:8000 or http://127.0.0.1:8000"
 
 
 class TestPhaseCWebhookAlertDispatcher:
@@ -479,7 +512,7 @@ class TestPhaseCSecurityHardening:
         )
 
         cfg = X402Config(enabled=True)
-        app = create_app(engine=paid_engine, storage=temp_storage, x402_config=cfg)
+        app = create_app(engine=paid_engine, storage=temp_storage, x402_config=cfg, public_evaluate_only=False)
         client = TestClient(app)
 
         async def mock_eval_det(*args, **kwargs):
@@ -500,7 +533,7 @@ class TestPhaseCSecurityHardening:
         """When X402_GATE_GOVERNANCE is configured, unauthenticated requests return 402 Payment Required."""
         monkeypatch.setenv("X402_GATE_GOVERNANCE", "true")
         cfg = X402Config(enabled=True)
-        app = create_app(storage=temp_storage, x402_config=cfg)
+        app = create_app(storage=temp_storage, x402_config=cfg, public_evaluate_only=False)
         client = TestClient(app)
 
         resp = client.post("/governance/audit-proposals", json={"limit": 1})
@@ -527,6 +560,7 @@ class TestPhaseCSecurityHardening:
             storage=temp_storage,
             x402_config=cfg,
             facilitator=facilitator,
+            public_evaluate_only=False,
         )
         client = TestClient(app)
 
@@ -568,3 +602,79 @@ class TestPhaseCSecurityHardening:
             content = f.read()
         assert "X402_USE_LIVE_FACILITATOR" in content
         assert re.search(r"^X402_USE_LIVE_FACILITATOR\s*=", content, re.MULTILINE) is not None
+
+    def test_public_evaluate_only_blocks_docs_and_internal_endpoints(self, temp_storage):
+        """In public_evaluate_only lockdown mode, docs, metrics, logs, payments, and governance endpoints return 403."""
+        cfg = X402Config(enabled=True)
+        app = create_app(storage=temp_storage, x402_config=cfg, public_evaluate_only=True)
+        client = TestClient(app)
+
+        # 1. Verify restricted endpoints return 403 Forbidden
+        restricted_endpoints = [
+            ("GET", "/docs"),
+            ("GET", "/redoc"),
+            ("GET", "/openapi.json"),
+            ("GET", "/metrics/summary"),
+            ("GET", "/logs/errors"),
+            ("GET", "/payments"),
+            ("POST", "/governance/audit-proposals"),
+        ]
+        for method, endpoint in restricted_endpoints:
+            if method == "GET":
+                resp = client.get(endpoint)
+            else:
+                resp = client.post(endpoint, json={"limit": 1})
+            assert resp.status_code == 403, f"{endpoint} expected 403, got {resp.status_code}"
+            data = resp.json()
+            assert data.get("error") == "Forbidden" or "Forbidden" in resp.text
+
+        # 2. Verify GET / returns 200, swagger_docs/docs not exposed, evaluate is exposed
+        root_resp = client.get("/")
+        assert root_resp.status_code == 200
+        root_data = root_resp.json()
+        endpoints = root_data.get("endpoints", {})
+        assert "swagger_docs" not in endpoints
+        assert "/docs" not in endpoints.values()
+        assert "evaluate" in endpoints
+        assert endpoints["evaluate"] == "/evaluate"
+
+        # 3. Verify evaluation-related endpoints are not blocked by 403
+        val_resp = client.post(
+            "/rules/validate",
+            json={
+                "rule_id": "test-validate",
+                "chain_id": 84532,
+                "deterministic": {"target_address": "0x0000000000000000000000000000000000000001"},
+            },
+        )
+        assert val_resp.status_code != 403
+
+        eval_resp = client.post(
+            "/evaluate",
+            json={
+                "rule_id": "rule-eval-lockdown",
+                "chain_id": 84532,
+                "deterministic": {"target_address": "0x0000000000000000000000000000000000000001"},
+                "semantic": {"enabled": False, "policy_prompt": "none"},
+            },
+        )
+        assert eval_resp.status_code == 402
+
+    def test_public_evaluate_only_allows_admin_key_bypass_when_configured(
+        self, temp_storage, monkeypatch
+    ):
+        """When ADMIN_API_KEY is configured, requests with X-Admin-Api-Key bypass the lockdown."""
+        monkeypatch.setenv("ADMIN_API_KEY", "test-secret-admin-key")
+        app = create_app(storage=temp_storage, public_evaluate_only=True)
+        client = TestClient(app)
+
+        # Without admin key header -> 403 Forbidden
+        unauth_resp = client.get("/metrics/summary")
+        assert unauth_resp.status_code == 403
+
+        # With valid X-Admin-Api-Key header -> 200 OK
+        auth_resp = client.get(
+            "/metrics/summary",
+            headers={"X-Admin-Api-Key": "test-secret-admin-key"},
+        )
+        assert auth_resp.status_code == 200

@@ -20,6 +20,17 @@ for _p in (_ROOT_DIR, _SRC_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+# Guarded dotenv loading: skipped during pytest execution or if python-dotenv not installed
+if "pytest" not in sys.modules:
+    try:
+        import dotenv
+        _env_file = os.path.join(_ROOT_DIR, ".env")
+        if os.path.exists(_env_file):
+            dotenv.load_dotenv(_env_file, override=False)
+        dotenv.load_dotenv(override=False)
+    except ImportError:
+        pass
+
 try:
     from src.schemas import ConditionRulePayload, FinalAgentResponse, DeterministicResult
     from src.chain_inspector import ChainInspector

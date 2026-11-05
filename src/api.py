@@ -185,11 +185,20 @@ def create_app(
     x402_config: Optional[X402Config] = None,
     facilitator: Optional[Any] = None,
     rate_limit_per_minute: Optional[int] = None,
+    public_evaluate_only: Optional[bool] = None,
 ) -> FastAPI:
     """
     Creates and configures the FastAPI application instance.
     Allows injecting custom ConditionAgentEngine, AgentStorage, X402Config, and facilitator instances.
     """
+
+    if public_evaluate_only is not None:
+        effective_public_evaluate_only = bool(public_evaluate_only)
+    else:
+        effective_public_evaluate_only = (
+            os.getenv("PUBLIC_EVALUATE_ONLY", "false").strip().lower()
+            in ("true", "1", "yes")
+        )
 
     @asynccontextmanager
     async def lifespan(app_instance: FastAPI):
@@ -205,6 +214,9 @@ def create_app(
             "and LLM-powered semantic governance/security auditing."
         ),
         lifespan=lifespan,
+        docs_url=None if effective_public_evaluate_only else "/docs",
+        redoc_url=None if effective_public_evaluate_only else "/redoc",
+        openapi_url=None if effective_public_evaluate_only else "/openapi.json",
     )
 
     # Enable CORS for B2B/Micro-SaaS integration
@@ -273,6 +285,38 @@ def create_app(
 
             buckets[client_ip].append(now)
             return await call_next(request)
+
+    # Public Evaluate-Only Lockdown Mode
+    app.state.public_evaluate_only = effective_public_evaluate_only
+
+    if effective_public_evaluate_only:
+        @app.middleware("http")
+        async def public_evaluate_only_middleware(request: Request, call_next):
+            # Optional admin bypass if ADMIN_API_KEY is configured
+            admin_key = os.getenv("ADMIN_API_KEY", "").strip()
+            if admin_key and request.headers.get("x-admin-api-key") == admin_key:
+                return await call_next(request)
+
+            allowed_paths = {
+                "/",
+                "/favicon.ico",
+                "/health",
+                "/evaluate",
+                "/rules/evaluate-batch",
+                "/rules/validate",
+                "/rules/enqueue",
+            }
+            path = request.url.path
+            if path in allowed_paths or path.startswith("/jobs/"):
+                return await call_next(request)
+
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": "Forbidden",
+                    "message": "Public access is restricted to evaluation endpoints only.",
+                },
+            )
 
     # Associate engine, storage, worker pool, and x402 state with application
     active_engine = engine if engine is not None else ConditionAgentEngine()
@@ -383,15 +427,16 @@ def create_app(
         and canonical API endpoint routes.
         """
         x402_cfg: X402Config = getattr(app.state, "x402_config", None) or X402Config()
-        return {
-            "service": "Web3 Condition-Action Trigger Agent",
-            "version": "1.0.0",
-            "status": "online",
-            "x402_enabled": x402_cfg.enabled,
-            "x402_network": x402_cfg.network,
-            "price_per_eval_usdc": x402_cfg.price_per_eval_usdc,
-            "pay_to_address": x402_cfg.pay_to_address,
-            "endpoints": {
+        if getattr(app.state, "public_evaluate_only", False):
+            endpoints = {
+                "health": "/health",
+                "validate_rule": "/rules/validate",
+                "evaluate": "/evaluate",
+                "evaluate_batch": "/rules/evaluate-batch",
+                "enqueue_job": "/rules/enqueue",
+            }
+        else:
+            endpoints = {
                 "swagger_docs": "/docs",
                 "health": "/health",
                 "validate_rule": "/rules/validate",
@@ -402,7 +447,16 @@ def create_app(
                 "metrics_summary": "/metrics/summary",
                 "payments_ledger": "/payments",
                 "error_logs": "/logs/errors",
-            },
+            }
+        return {
+            "service": "Web3 Condition-Action Trigger Agent",
+            "version": "1.0.0",
+            "status": "online",
+            "x402_enabled": x402_cfg.enabled,
+            "x402_network": x402_cfg.network,
+            "price_per_eval_usdc": x402_cfg.price_per_eval_usdc,
+            "pay_to_address": x402_cfg.pay_to_address,
+            "endpoints": endpoints,
         }
 
     @app.get("/favicon.ico", include_in_schema=False)

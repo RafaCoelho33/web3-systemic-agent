@@ -25,12 +25,13 @@ for _p in (_ROOT_DIR, _SRC_DIR):
         sys.path.insert(0, _p)
 
 # 2. Call dotenv.load_dotenv(override=False) so GEMINI_API_KEY is loaded
-import dotenv
+if "pytest" not in sys.modules:
+    import dotenv
 
-_env_file = os.path.join(_ROOT_DIR, ".env")
-if os.path.exists(_env_file):
-    dotenv.load_dotenv(_env_file, override=False)
-dotenv.load_dotenv(override=False)
+    _env_file = os.path.join(_ROOT_DIR, ".env")
+    if os.path.exists(_env_file):
+        dotenv.load_dotenv(_env_file, override=False)
+    dotenv.load_dotenv(override=False)
 
 # Configure responsive Gemini model default
 if "GEMINI_MODEL" not in os.environ:
