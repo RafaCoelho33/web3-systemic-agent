@@ -51,6 +51,8 @@ for _p in (_ROOT_DIR, _SRC_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+logger = logging.getLogger(__name__)
+
 try:
     from src.schemas import PaymentReceipt, ConditionRulePayload, FinalAgentResponse
 except ImportError:
@@ -78,10 +80,9 @@ try:
         bazaar_resource_server_extension,
     )
     HAS_X402_SDK = True
-except ImportError:
+except ImportError as exc:
     HAS_X402_SDK = False
-
-logger = logging.getLogger(__name__)
+    logger.warning("x402 SDK import failed: %s", exc)
 
 # Protocol Constants
 USDC_DECIMALS: int = 6
@@ -963,10 +964,31 @@ class HTTPX402Facilitator:
 
         base_url = (self.facilitator_url or config.facilitator_url).rstrip("/")
         url = f"{base_url}/verify"
+        req_dict = payment_data.get("accepted")
+        if not isinstance(req_dict, dict):
+            req_dict = {
+                "scheme": "exact",
+                "network": config.network,
+                "asset": config.usdc_contract_address,
+                "amount": str(required_atomic),
+                "payTo": config.pay_to_address,
+                "maxTimeoutSeconds": 300,
+                "extra": {"name": "USDC", "version": "2"},
+            }
+
+        payment_payload_dict = {
+            "x402Version": payment_data.get("x402Version", 2),
+            "payload": payment_data.get("payload") if isinstance(payment_data.get("payload"), dict) else {
+                "authorization": payment_data.get("authorization", {}),
+                "signature": payment_data.get("signature", ""),
+            },
+            "accepted": req_dict,
+        }
+
         payload = {
-            "payment_data": payment_data,
-            "required_atomic": required_atomic,
-            "network": config.network,
+            "x402Version": payment_data.get("x402Version", 2),
+            "paymentPayload": payment_payload_dict,
+            "paymentRequirements": req_dict,
         }
         headers = {}
         if config.has_cdp_credentials():
@@ -983,7 +1005,18 @@ class HTTPX402Facilitator:
                     resp = await client.post(url, json=payload, headers=headers if headers else None)
             if resp.status_code == 200:
                 data = resp.json()
-                return VerificationResult(**data)
+                is_valid = data.get("isValid", data.get("valid", False))
+                if isinstance(data.get("verify"), dict):
+                    is_valid = data["verify"].get("isValid", data["verify"].get("valid", is_valid))
+                invalid_reason = data.get("invalidReason", data.get("reason"))
+                return VerificationResult(
+                    valid=bool(is_valid),
+                    reason=invalid_reason,
+                    payment_id=payment_id,
+                    payer_address=payer_address,
+                    amount_atomic=amount_atomic,
+                    amount_usdc=amount_usdc,
+                )
             else:
                 return VerificationResult(
                     valid=False,
@@ -1061,10 +1094,32 @@ class HTTPX402Facilitator:
 
         base_url = (self.facilitator_url or config.facilitator_url).rstrip("/")
         url = f"{base_url}/settle"
+        req_dict = payment_data.get("accepted")
+        if not isinstance(req_dict, dict):
+            amount_atomic = int(payment_data.get("amount_atomic", required_atomic))
+            req_dict = {
+                "scheme": "exact",
+                "network": config.network,
+                "asset": config.usdc_contract_address,
+                "amount": str(amount_atomic),
+                "payTo": config.pay_to_address,
+                "maxTimeoutSeconds": 300,
+                "extra": {"name": "USDC", "version": "2"},
+            }
+
+        payment_payload_dict = {
+            "x402Version": payment_data.get("x402Version", 2),
+            "payload": payment_data.get("payload") if isinstance(payment_data.get("payload"), dict) else {
+                "authorization": payment_data.get("authorization", {}),
+                "signature": payment_data.get("signature", ""),
+            },
+            "accepted": req_dict,
+        }
+
         payload = {
-            "payment_data": payment_data,
-            "required_atomic": required_atomic,
-            "network": config.network,
+            "x402Version": payment_data.get("x402Version", 2),
+            "paymentPayload": payment_payload_dict,
+            "paymentRequirements": req_dict,
         }
         headers = {}
         if config.has_cdp_credentials():
@@ -1081,7 +1136,17 @@ class HTTPX402Facilitator:
                     resp = await client.post(url, json=payload, headers=headers if headers else None)
             if resp.status_code == 200:
                 data = resp.json()
-                return SettlementResult(**data)
+                settled = data.get("success", data.get("settled", False))
+                if isinstance(data.get("settle"), dict):
+                    settled = data["settle"].get("success", data["settle"].get("settled", settled))
+                tx_hash = data.get("transaction", data.get("tx_hash"))
+                if isinstance(data.get("settle"), dict) and not tx_hash:
+                    tx_hash = data["settle"].get("transaction", data["settle"].get("tx_hash"))
+                return SettlementResult(
+                    settled=bool(settled),
+                    tx_hash=tx_hash,
+                    error=data.get("errorMessage", data.get("error")),
+                )
             else:
                 return SettlementResult(
                     settled=False,

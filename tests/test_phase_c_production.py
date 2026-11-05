@@ -874,6 +874,69 @@ class TestPhaseCBazaarAndCDPMainnet:
         assert len(parts) == 3
         assert called_headers["X-CDP-API-KEY-ID"] == "uuid-key-1"
 
+        json_payload = mock_client.post.call_args.kwargs["json"]
+        assert json_payload["x402Version"] == 2
+        assert "paymentPayload" in json_payload
+        assert "paymentRequirements" in json_payload
+        assert json_payload["paymentPayload"]["x402Version"] == 2
+
+    @pytest.mark.asyncio
+    async def test_http_facilitator_rest_fallback_settle_payload(self):
+        """HTTPX402Facilitator REST fallback settle sends x402 V2 payload with paymentPayload and paymentRequirements."""
+        import base64
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        from cryptography.hazmat.primitives import serialization
+        from src.x402_payment import X402Config, HTTPX402Facilitator
+
+        private_key = ed25519.Ed25519PrivateKey.generate()
+        der_bytes = private_key.private_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        der_b64 = base64.b64encode(der_bytes).decode("ascii")
+
+        cfg = X402Config(
+            enabled=True,
+            network="eip155:8453",
+            cdp_api_key_id="uuid-key-settle",
+            cdp_api_key_secret=der_b64,
+        )
+
+        mock_resp = MagicMock(
+            status_code=200,
+            json=lambda: {
+                "success": True,
+                "transaction": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+            },
+        )
+        mock_client = MagicMock(spec=httpx.AsyncClient)
+        mock_client.post = AsyncMock(return_value=mock_resp)
+
+        facilitator = HTTPX402Facilitator(client=mock_client)
+        payment_data = {
+            "payment_id": "p-settle-1",
+            "payer_address": "0x1111111111111111111111111111111111111111",
+            "amount_atomic": 50000,
+        }
+        res = await facilitator.settle(payment_data, 50000, cfg)
+        assert res.settled is True
+        assert res.tx_hash == "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+
+        # Verify headers
+        called_headers = mock_client.post.call_args.kwargs["headers"]
+        assert "Authorization" in called_headers
+        assert called_headers["Authorization"].startswith("Bearer ")
+        assert called_headers["X-CDP-API-KEY-ID"] == "uuid-key-settle"
+
+        # Verify x402 V2 REST payload
+        json_payload = mock_client.post.call_args.kwargs["json"]
+        assert json_payload["x402Version"] == 2
+        assert "paymentPayload" in json_payload
+        assert "paymentRequirements" in json_payload
+        assert json_payload["paymentPayload"]["x402Version"] == 2
+        assert json_payload["paymentRequirements"]["amount"] == "50000"
+
 
 
 
