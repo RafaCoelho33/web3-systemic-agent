@@ -825,12 +825,15 @@ class TestSection4X402Module:
         assert "Simulated facilitator settlement error" in res.error
 
     def test_build_402_response_structure_and_headers(self):
-        """Contract 4: build_402_response outputs compliant HTTP 402 with X-PAYMENT-REQUIRED header."""
+        """Contract 4: build_402_response outputs compliant HTTP 402 with X-PAYMENT-REQUIRED and base64 Payment-Required header."""
         cfg = X402Config()
         resp = build_402_response(cfg, "/evaluate", 0.01, reason="Payment Required")
         assert resp.status_code == 402
         assert resp.headers.get("X-PAYMENT-REQUIRED") == "true"
+        pr_header = resp.headers.get("Payment-Required")
+        assert pr_header is not None
         body = json.loads(resp.body.decode())
+        assert json.loads(base64.b64decode(pr_header).decode("utf-8")) == body
         assert body["x402Version"] == 1
         assert body["error"] == "PaymentRequired"
         assert body["message"] == "Payment Required"
@@ -993,13 +996,16 @@ class TestSection5FastAPIPaidMode:
         assert r5.status_code == 200
 
     def test_paid_routes_missing_header_return_402(self, paid_app_setup, base_payload):
-        """Contract 5: Paid routes without X-PAYMENT header return HTTP 402 with X-PAYMENT-REQUIRED."""
+        """Contract 5: Paid routes without X-PAYMENT header return HTTP 402 with X-PAYMENT-REQUIRED and base64 Payment-Required."""
         _, client, _, facilitator, _ = paid_app_setup
 
         # POST /evaluate
         resp = client.post("/evaluate", json=base_payload.model_dump(mode="json"))
         assert resp.status_code == 402
         assert resp.headers.get("X-PAYMENT-REQUIRED") == "true"
+        pr_header = resp.headers.get("Payment-Required")
+        assert pr_header is not None
+        assert json.loads(base64.b64decode(pr_header).decode("utf-8")) == resp.json()
         body = resp.json()
         assert body["error"] == "PaymentRequired"
         assert body["accepts"][0]["maxAmountRequired"] == "10000"
@@ -1009,6 +1015,9 @@ class TestSection5FastAPIPaidMode:
         resp_enq = client.post("/rules/enqueue", json=base_payload.model_dump(mode="json"))
         assert resp_enq.status_code == 402
         assert resp_enq.headers.get("X-PAYMENT-REQUIRED") == "true"
+        pr_enq = resp_enq.headers.get("Payment-Required")
+        assert pr_enq is not None
+        assert json.loads(base64.b64decode(pr_enq).decode("utf-8")) == resp_enq.json()
         assert resp_enq.json()["accepts"][0]["maxAmountRequired"] == "10000"
         assert facilitator.settle_calls == 0
 
@@ -1020,6 +1029,9 @@ class TestSection5FastAPIPaidMode:
         resp = client.post("/rules/evaluate-batch", json=batch_3)
         assert resp.status_code == 402
         assert resp.headers.get("X-PAYMENT-REQUIRED") == "true"
+        pr_header = resp.headers.get("Payment-Required")
+        assert pr_header is not None
+        assert json.loads(base64.b64decode(pr_header).decode("utf-8")) == resp.json()
         body = resp.json()
         # 3 items * 10000 = 30000 atomic
         assert body["accepts"][0]["maxAmountRequired"] == "30000"

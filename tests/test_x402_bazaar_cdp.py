@@ -18,6 +18,7 @@ Core Specifications Covered:
 """
 
 import asyncio
+import base64
 import json
 import os
 import sys
@@ -203,10 +204,11 @@ def simulate_cdp_validator(
             body = None
     elif isinstance(response, dict):
         status_code = 402
+        b64_payment_required = base64.b64encode(json.dumps(response).encode("utf-8")).decode("utf-8")
         headers = {
             "content-type": "application/json",
             "x-payment-required": "true",
-            "payment-required": "true",
+            "payment-required": b64_payment_required,
         }
         body = response
     else:
@@ -257,15 +259,25 @@ def simulate_cdp_validator(
         f"Content-Type: '{content_type}'" if is_json else f"Content-Type must be application/json, got '{content_type}'",
     )
 
-    # Check 4: Payment Required Header
+    # Check 4: Payment Required Header (standard base64-encoded JSON)
+    raw_pr = headers.get("payment-required")
+    has_valid_pr = False
+    if raw_pr is not None:
+        try:
+            decoded_pr = json.loads(base64.b64decode(raw_pr).decode("utf-8"))
+            if isinstance(decoded_pr, dict):
+                has_valid_pr = True
+        except Exception:
+            has_valid_pr = False
+
     has_payment_header = (
-        headers.get("payment-required", "").lower() == "true"
-        or headers.get("x-payment-required", "").lower() == "true"
+        has_valid_pr
+        or (raw_pr is None and headers.get("x-payment-required", "").lower() == "true")
     )
     add_check(
         4, "payment_required_header_present", "transport", "required",
         has_payment_header,
-        "Header 'Payment-Required' or 'X-PAYMENT-REQUIRED' is 'true'" if has_payment_header else "Missing Payment-Required or X-PAYMENT-REQUIRED header",
+        "Header 'Payment-Required' is valid base64-encoded JSON" if has_valid_pr else ("Header 'X-PAYMENT-REQUIRED' is 'true'" if has_payment_header else "Missing or un-decodable Payment-Required header (must be standard base64-encoded JSON)"),
     )
 
     # --- Category 2: Top-Level x402 Protocol Payload (Checks 5-9) ---
@@ -535,13 +547,12 @@ class TestX402BazaarCDPConformance:
         assert resp.status_code == 402, f"Expected 402, got {resp.status_code}: {resp.text}"
 
         # Header assertion
-        assert (
-            resp.headers.get("Payment-Required") == "true"
-            or resp.headers.get("X-PAYMENT-REQUIRED") == "true"
-        ), "Response must include Payment-Required or X-PAYMENT-REQUIRED header"
-
-        # Body JSON assertions
+        assert resp.headers.get("X-PAYMENT-REQUIRED") == "true"
+        pr_header = resp.headers.get("Payment-Required")
+        assert pr_header is not None, "Response must include Payment-Required header"
+        decoded_pr = json.loads(base64.b64decode(pr_header).decode("utf-8"))
         body = resp.json()
+        assert decoded_pr == body, "Payment-Required header must be valid base64-encoded JSON equal to body"
         assert "accepts" in body, "Response body must contain 'accepts' list"
         assert isinstance(body["accepts"], list) and len(body["accepts"]) >= 1
         assert "extensions" in body, "Response body must contain 'extensions' dictionary"
@@ -569,11 +580,12 @@ class TestX402BazaarCDPConformance:
         assert resp.status_code != 422, "CDP crawler empty probe must not trigger 422 schema validation error"
 
         # Headers and payload
-        assert (
-            resp.headers.get("Payment-Required") == "true"
-            or resp.headers.get("X-PAYMENT-REQUIRED") == "true"
-        )
+        assert resp.headers.get("X-PAYMENT-REQUIRED") == "true"
+        pr_header = resp.headers.get("Payment-Required")
+        assert pr_header is not None, "Response must include Payment-Required header"
+        decoded_pr = json.loads(base64.b64decode(pr_header).decode("utf-8"))
         body = resp.json()
+        assert decoded_pr == body, "Payment-Required header must be valid base64-encoded JSON equal to body"
         assert "accepts" in body
         assert len(body["accepts"]) > 0
         assert body["accepts"][0]["scheme"] == "exact"
@@ -623,6 +635,12 @@ class TestX402BazaarCDPConformance:
         resp_402 = build_402_response(x402_config, "/evaluate", 0.05)
         assert resp_402.status_code == 402
         body = json.loads(resp_402.body)
+
+        # Header validation (Payment-Required is base64-encoded JSON equal to body)
+        assert resp_402.headers.get("X-PAYMENT-REQUIRED") == "true"
+        pr_header = resp_402.headers.get("Payment-Required")
+        assert pr_header is not None
+        assert json.loads(base64.b64decode(pr_header).decode("utf-8")) == body
 
         # 1. accepts[0] validations
         accepts = body["accepts"]
@@ -730,7 +748,11 @@ class TestX402BazaarCDPConformance:
         # Anomaly 1: Status 200 instead of 402
         class Mock200Response:
             status_code = 200
-            headers = {"content-type": "application/json", "Payment-Required": "true"}
+            headers = {
+                "content-type": "application/json",
+                "x-payment-required": "true",
+                "payment-required": base64.b64encode(json.dumps(valid_body).encode("utf-8")).decode("utf-8"),
+            }
             def json(self): return valid_body
 
         res_200 = simulate_cdp_validator(Mock200Response(), url="/evaluate")
@@ -764,6 +786,20 @@ class TestX402BazaarCDPConformance:
         del bad_amount_body["accepts"][0]["amount"]
         res_bad_amount = simulate_cdp_validator(bad_amount_body, url="/evaluate")
         assert any(c["name"] == "accepts_0_amount_atomic_str" and not c["passed"] for c in res_bad_amount["checks"])
+
+        # Anomaly 6: Un-decodable Payment-Required header (raw string "true" instead of base64-encoded JSON)
+        class MockBadHeaderResponse:
+            status_code = 402
+            headers = {
+                "content-type": "application/json",
+                "x-payment-required": "true",
+                "payment-required": "true",
+            }
+            def json(self): return valid_body
+
+        res_bad_hdr = simulate_cdp_validator(MockBadHeaderResponse(), url="/evaluate")
+        assert res_bad_hdr["valid"] is False
+        assert any(c["name"] == "payment_required_header_present" and not c["passed"] for c in res_bad_hdr["checks"])
 
     def test_bazaar_fallback_fidelity_without_x402_sdk(self, monkeypatch):
         """

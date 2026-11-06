@@ -17,6 +17,8 @@ Validates Phase C deliverables:
    - End-to-end integration with governance_listener.py runner
 """
 
+import base64
+import json
 import os
 import re
 import sys
@@ -706,7 +708,9 @@ class TestPhaseCBazaarAndCDPMainnet:
         assert accept_item["usdcAddress"] == cfg.usdc_contract_address
         assert accept_item["maxTimeoutSeconds"] == 300
         assert response.headers.get("X-PAYMENT-REQUIRED") == "true"
-        assert response.headers.get("Payment-Required") == "true"
+        pr_header = response.headers.get("Payment-Required")
+        assert pr_header is not None
+        assert json.loads(base64.b64decode(pr_header).decode("utf-8")) == body
 
     def test_bazaar_fallback_without_sdk_has_method_post(self, monkeypatch):
         """Bazaar discovery extension fallback contains method='POST' when x402 SDK is absent."""
@@ -730,7 +734,9 @@ class TestPhaseCBazaarAndCDPMainnet:
         resp = client.get("/evaluate")
         assert resp.status_code == 402
         assert resp.headers.get("X-PAYMENT-REQUIRED") == "true"
-        assert resp.headers.get("Payment-Required") == "true"
+        pr_header = resp.headers.get("Payment-Required")
+        assert pr_header is not None
+        assert json.loads(base64.b64decode(pr_header).decode("utf-8")) == resp.json()
 
         data = resp.json()
         assert "extensions" in data
@@ -753,13 +759,17 @@ class TestPhaseCBazaarAndCDPMainnet:
         resp_empty = client.post("/evaluate", json={})
         assert resp_empty.status_code == 402
         assert resp_empty.headers.get("X-PAYMENT-REQUIRED") == "true"
-        assert resp_empty.headers.get("Payment-Required") == "true"
+        pr_empty = resp_empty.headers.get("Payment-Required")
+        assert pr_empty is not None
+        assert json.loads(base64.b64decode(pr_empty).decode("utf-8")) == resp_empty.json()
 
         # Arbitrary body without payment headers must return 402 directly
         resp_bad = client.post("/evaluate", json={"invalid": "payload"})
         assert resp_bad.status_code == 402
         assert resp_bad.headers.get("X-PAYMENT-REQUIRED") == "true"
-        assert resp_bad.headers.get("Payment-Required") == "true"
+        pr_bad = resp_bad.headers.get("Payment-Required")
+        assert pr_bad is not None
+        assert json.loads(base64.b64decode(pr_bad).decode("utf-8")) == resp_bad.json()
 
     def test_evaluate_post_with_payment_header_and_invalid_body_returns_422(self, temp_storage):
         """POST /evaluate with payment header and invalid body triggers FastAPI validation and returns 422."""

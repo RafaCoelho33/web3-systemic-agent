@@ -1235,8 +1235,13 @@ def build_402_response(
         ],
         "extensions": build_bazaar_discovery_extension(endpoint),
     }
+    b64_payment_required = base64.b64encode(json.dumps(body).encode("utf-8")).decode("utf-8")
+    headers = {
+        "X-PAYMENT-REQUIRED": "true",
+        "Payment-Required": b64_payment_required,
+    }
     return JSONResponse(
         status_code=402,
         content=body,
-        headers={"X-PAYMENT-REQUIRED": "true", "Payment-Required": "true"},
+        headers=headers,
     )

@@ -232,7 +232,7 @@ def create_app(
         allow_credentials=allow_credentials,
         allow_methods=["*"],
         allow_headers=["*"],
-        expose_headers=["X-PAYMENT-REQUIRED", "X-PAYMENT-RESPONSE", "PAYMENT-RESPONSE"],
+        expose_headers=["X-PAYMENT-REQUIRED", "X-PAYMENT-RESPONSE", "PAYMENT-RESPONSE", "Payment-Required"],
     )
 
     # Per-IP Sliding-Window Rate Limiter
