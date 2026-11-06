@@ -1212,7 +1212,7 @@ def build_402_response(
     required_atomic = usdc_to_atomic(required_usdc)
     token_name = "USD Coin" if config.network == "eip155:8453" else "USDC"
     body = {
-        "x402Version": 1,
+        "x402Version": 2,
         "error": "PaymentRequired",
         "message": reason,
         "accepts": [

@@ -289,13 +289,17 @@ def simulate_cdp_validator(
         "Response body successfully parsed as JSON object" if is_dict else "Response body is not a JSON object",
     )
 
-    # Check 6: x402Version field
+    # Check 6: x402Version field (Bazaar requires v2)
     version_val = body.get("x402Version") if is_dict else None
-    has_valid_version = isinstance(version_val, int) and version_val >= 1
+    has_valid_version = isinstance(version_val, int) and version_val == 2
     add_check(
-        6, "x402_version_valid", "x402_protocol", "required",
+        6, "x402_version", "x402_protocol", "required",
         has_valid_version,
-        f"x402Version: {version_val}" if has_valid_version else f"x402Version must be integer >= 1, got {version_val}",
+        f"x402Version: {version_val}" if has_valid_version else (
+            f"Endpoint uses x402 v{version_val} — upgrade to x402 v2 to be discoverable in the bazaar"
+            if isinstance(version_val, int)
+            else f"x402Version must be integer equal to 2, got {version_val}"
+        ),
     )
 
     # Check 7: Error discriminator field
@@ -553,6 +557,7 @@ class TestX402BazaarCDPConformance:
         decoded_pr = json.loads(base64.b64decode(pr_header).decode("utf-8"))
         body = resp.json()
         assert decoded_pr == body, "Payment-Required header must be valid base64-encoded JSON equal to body"
+        assert body.get("x402Version") == 2, f"Expected x402Version == 2 for Bazaar discovery, got {body.get('x402Version')}"
         assert "accepts" in body, "Response body must contain 'accepts' list"
         assert isinstance(body["accepts"], list) and len(body["accepts"]) >= 1
         assert "extensions" in body, "Response body must contain 'extensions' dictionary"
@@ -635,6 +640,7 @@ class TestX402BazaarCDPConformance:
         resp_402 = build_402_response(x402_config, "/evaluate", 0.05)
         assert resp_402.status_code == 402
         body = json.loads(resp_402.body)
+        assert body.get("x402Version") == 2, f"Expected x402Version == 2 for Bazaar discovery, got {body.get('x402Version')}"
 
         # Header validation (Payment-Required is base64-encoded JSON equal to body)
         assert resp_402.headers.get("X-PAYMENT-REQUIRED") == "true"
@@ -800,6 +806,15 @@ class TestX402BazaarCDPConformance:
         res_bad_hdr = simulate_cdp_validator(MockBadHeaderResponse(), url="/evaluate")
         assert res_bad_hdr["valid"] is False
         assert any(c["name"] == "payment_required_header_present" and not c["passed"] for c in res_bad_hdr["checks"])
+
+        # Anomaly 7: x402Version 1 instead of 2 (CDP Bazaar discovery rejection)
+        bad_version_body = json.loads(json.dumps(valid_body))
+        bad_version_body["x402Version"] = 1
+        res_bad_ver = simulate_cdp_validator(bad_version_body, url="/evaluate")
+        assert res_bad_ver["valid"] is False
+        assert any(c["name"] == "x402_version" and not c["passed"] for c in res_bad_ver["checks"])
+        ver_check = next(c for c in res_bad_ver["checks"] if c["name"] == "x402_version")
+        assert "upgrade to x402 v2 to be discoverable in the bazaar" in ver_check["details"]
 
     def test_bazaar_fallback_fidelity_without_x402_sdk(self, monkeypatch):
         """

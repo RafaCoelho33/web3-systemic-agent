@@ -687,6 +687,7 @@ class TestPhaseCBazaarAndCDPMainnet:
         response = build_402_response(cfg, "/evaluate", 0.05)
         body = json.loads(response.body)
 
+        assert body.get("x402Version") == 2, "Expected x402Version == 2 for Bazaar discovery"
         assert "extensions" in body, "Expected 'extensions' key in 402 response body"
         assert "bazaar" in body["extensions"], "Expected 'bazaar' extension in 402 response body"
 

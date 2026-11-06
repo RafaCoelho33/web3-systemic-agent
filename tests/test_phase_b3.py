@@ -834,7 +834,7 @@ class TestSection4X402Module:
         assert pr_header is not None
         body = json.loads(resp.body.decode())
         assert json.loads(base64.b64decode(pr_header).decode("utf-8")) == body
-        assert body["x402Version"] == 1
+        assert body["x402Version"] == 2
         assert body["error"] == "PaymentRequired"
         assert body["message"] == "Payment Required"
         assert len(body["accepts"]) == 1
