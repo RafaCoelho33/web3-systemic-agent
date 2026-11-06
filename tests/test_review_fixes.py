@@ -905,7 +905,7 @@ class TestHygiene:
             mock_insp_cls_src.return_value = mock_insp
             mock_insp_cls_src.DEFAULT_RPCS = ChainInspector.DEFAULT_RPCS
 
-            client.get("/health")
+            client.get("/health?full=true")
 
             assert mock_insp_cls_src.call_count >= 1
             for call in mock_insp_cls_src.call_args_list:

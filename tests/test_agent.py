@@ -1050,9 +1050,14 @@ class TestFastAPIServiceLayer:
         test_app = create_app()
         return TestClient(test_app)
 
+    def test_health_check_default_is_simple(self, test_client):
+        response = test_client.get("/health")
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+
     def test_health_check_all_rpcs_ok(self, test_client):
         with patch.object(ChainInspector, "verify_connection", AsyncMock(return_value=True)):
-            response = test_client.get("/health")
+            response = test_client.get("/health?full=true")
             assert response.status_code == 200
             data = response.json()
             assert data["status"] == "ok"
@@ -1065,7 +1070,7 @@ class TestFastAPIServiceLayer:
             return self.chain_id == 84532
 
         with patch.object(ChainInspector, "verify_connection", mock_verify):
-            response = test_client.get("/health")
+            response = test_client.get("/health?full=true")
             assert response.status_code == 200
             data = response.json()
             assert data["status"] == "degraded"
@@ -1074,7 +1079,7 @@ class TestFastAPIServiceLayer:
 
     def test_health_check_all_rpcs_fail(self, test_client):
         with patch.object(ChainInspector, "verify_connection", AsyncMock(return_value=False)):
-            response = test_client.get("/health")
+            response = test_client.get("/health?full=true")
             assert response.status_code == 200
             data = response.json()
             assert data["status"] == "error"
@@ -1088,7 +1093,7 @@ class TestFastAPIServiceLayer:
         client = TestClient(custom_app)
 
         with patch.object(ChainInspector, "verify_connection", AsyncMock(return_value=True)):
-            response = client.get("/health")
+            response = client.get("/health?full=true")
             assert response.status_code == 200
             data = response.json()
             assert data["status"] == "ok"
@@ -1106,7 +1111,7 @@ class TestFastAPIServiceLayer:
         client = TestClient(custom_app)
 
         with patch.object(ChainInspector, "verify_connection", AsyncMock(return_value=True)):
-            response = client.get("/health")
+            response = client.get("/health?full=true")
             assert response.status_code == 200
             data = response.json()
             assert data["status"] == "ok"

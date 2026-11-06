@@ -14,7 +14,7 @@ import re
 import time
 import traceback
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Union
 
 # Ensure module search paths support running directly or as a package
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -141,6 +141,10 @@ class ServiceDiscoveryResponse(BaseModel):
     price_per_eval_usdc: float = Field(default=0.01, description="Base price in USDC per evaluation")
     pay_to_address: Optional[str] = Field(default=None, description="Recipient EVM address for x402 micropayments")
     endpoints: Dict[str, str] = Field(..., description="Canonical API endpoint route registry")
+
+
+class SimpleHealthResponse(BaseModel):
+    status: str = Field(default="ok", description="Basic health status")
 
 
 class HealthCheckResponse(BaseModel):
@@ -486,12 +490,23 @@ def create_app(
         """
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-    @app.get("/health", response_model=HealthCheckResponse, tags=["Monitoring"])
-    async def health_check():
+    @app.get(
+        "/health",
+        response_model=Union[SimpleHealthResponse, HealthCheckResponse],
+        tags=["Monitoring"],
+    )
+    async def health_check(full: bool = False):
         """
-        Asynchronously checks RPC connectivity across configured EVM networks
-        and reports the operational status of the semantic evaluation provider.
+        Asynchronously checks service health.
+
+        - If full=False (default): Returns an ultra-lightweight response {"status": "ok"}
+          suitable for high-frequency cron jobs and external uptime monitors.
+        - If full=True: Probes RPC connectivity across configured EVM networks
+          and reports operational status of the semantic evaluation provider and x402 gate.
         """
+        if not full:
+            return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "ok"})
+
         active_engine: ConditionAgentEngine = app.state.engine
 
         async def _check_rpc(chain_id: int, url: str) -> tuple[int, bool]:

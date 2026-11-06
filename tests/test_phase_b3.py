@@ -964,7 +964,13 @@ class TestSection5FastAPIPaidMode:
     def test_health_check_reports_x402_status_and_free_access(self, paid_app_setup):
         """Contract 5: GET /health returns HTTP 200 without payment and includes x402 status."""
         _, client, _, _, _ = paid_app_setup
-        resp = client.get("/health")
+        # Default simple health check returns 200 without payment
+        simple_resp = client.get("/health")
+        assert simple_resp.status_code == 200
+        assert simple_resp.json() == {"status": "ok"}
+
+        # Full health check includes detailed x402 status
+        resp = client.get("/health?full=true")
         assert resp.status_code == 200
         data = resp.json()
         assert data.get("x402_enabled") is True
