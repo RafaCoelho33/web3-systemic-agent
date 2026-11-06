@@ -102,6 +102,8 @@ NETWORK_PROFILES: Dict[str, Dict[str, Any]] = {
         "is_testnet": True,
         "usdc_address": BASE_SEPOLIA_USDC,
         "default_rpc": "https://sepolia.base.org",
+        "token_name": "USDC",
+        "token_version": "2",
     },
     "eip155:8453": {
         "chain_id": 8453,
@@ -109,6 +111,8 @@ NETWORK_PROFILES: Dict[str, Dict[str, Any]] = {
         "is_testnet": False,
         "usdc_address": BASE_MAINNET_USDC,
         "default_rpc": "https://mainnet.base.org",
+        "token_name": "USD Coin",
+        "token_version": "2",
     },
     "eip155:42161": {
         "chain_id": 42161,
@@ -116,6 +120,8 @@ NETWORK_PROFILES: Dict[str, Dict[str, Any]] = {
         "is_testnet": False,
         "usdc_address": ARBITRUM_ONE_USDC,
         "default_rpc": "https://arb1.arbitrum.io/rpc",
+        "token_name": "USD Coin",
+        "token_version": "2",
     },
 }
 
@@ -607,6 +613,15 @@ def create_eip3009_payment_header(
     cli = x402ClientSync()
     cli.register(network, ExactEvmClientScheme(account))
 
+    token_name = "USDC"
+    token_version = "2"
+    try:
+        prof = get_network_profile(network)
+        token_name = prof.get("token_name", "USDC")
+        token_version = prof.get("token_version", "2")
+    except Exception:
+        pass
+
     req = PaymentRequirements(
         scheme="exact",
         network=network,
@@ -614,7 +629,7 @@ def create_eip3009_payment_header(
         amount=str(amount_atomic),
         pay_to=checksum_pay_to,
         max_timeout_seconds=300,
-        extra={"name": "USDC", "version": "2"},
+        extra={"name": token_name, "version": token_version},
     )
     payment_required = PaymentRequired(x402_version=2, accepts=[req])
     payload_obj = cli.create_payment_payload(payment_required)
@@ -922,6 +937,7 @@ class HTTPX402Facilitator:
             if isinstance(accepted_data, dict):
                 req = PaymentRequirements.model_validate(accepted_data)
             else:
+                token_name = "USD Coin" if config.network == "eip155:8453" else "USDC"
                 req = PaymentRequirements(
                     scheme="exact",
                     network=config.network,
@@ -929,7 +945,7 @@ class HTTPX402Facilitator:
                     amount=str(amount_atomic),
                     pay_to=config.pay_to_address,
                     max_timeout_seconds=300,
-                    extra={"name": "USDC", "version": "2"},
+                    extra={"name": token_name, "version": "2"},
                 )
 
             payload_dict = {
@@ -966,6 +982,7 @@ class HTTPX402Facilitator:
         url = f"{base_url}/verify"
         req_dict = payment_data.get("accepted")
         if not isinstance(req_dict, dict):
+            token_name = "USD Coin" if config.network == "eip155:8453" else "USDC"
             req_dict = {
                 "scheme": "exact",
                 "network": config.network,
@@ -973,7 +990,7 @@ class HTTPX402Facilitator:
                 "amount": str(required_atomic),
                 "payTo": config.pay_to_address,
                 "maxTimeoutSeconds": 300,
-                "extra": {"name": "USDC", "version": "2"},
+                "extra": {"name": token_name, "version": "2"},
             }
 
         payment_payload_dict = {
@@ -1056,6 +1073,7 @@ class HTTPX402Facilitator:
                 req = PaymentRequirements.model_validate(accepted_data)
             else:
                 amount_atomic = int(payment_data.get("amount_atomic", required_atomic))
+                token_name = "USD Coin" if config.network == "eip155:8453" else "USDC"
                 req = PaymentRequirements(
                     scheme="exact",
                     network=config.network,
@@ -1063,7 +1081,7 @@ class HTTPX402Facilitator:
                     amount=str(amount_atomic),
                     pay_to=config.pay_to_address,
                     max_timeout_seconds=300,
-                    extra={"name": "USDC", "version": "2"},
+                    extra={"name": token_name, "version": "2"},
                 )
 
             payload_dict = {
@@ -1097,6 +1115,7 @@ class HTTPX402Facilitator:
         req_dict = payment_data.get("accepted")
         if not isinstance(req_dict, dict):
             amount_atomic = int(payment_data.get("amount_atomic", required_atomic))
+            token_name = "USD Coin" if config.network == "eip155:8453" else "USDC"
             req_dict = {
                 "scheme": "exact",
                 "network": config.network,
@@ -1104,7 +1123,7 @@ class HTTPX402Facilitator:
                 "amount": str(amount_atomic),
                 "payTo": config.pay_to_address,
                 "maxTimeoutSeconds": 300,
-                "extra": {"name": "USDC", "version": "2"},
+                "extra": {"name": token_name, "version": "2"},
             }
 
         payment_payload_dict = {
@@ -1184,6 +1203,7 @@ def build_402_response(
     and Bazaar auto-discovery extensions.
     """
     required_atomic = usdc_to_atomic(required_usdc)
+    token_name = "USD Coin" if config.network == "eip155:8453" else "USDC"
     body = {
         "x402Version": 1,
         "error": "PaymentRequired",
@@ -1201,7 +1221,7 @@ def build_402_response(
                 "description": f"Web3 Security & Governance Audit for {endpoint} — EVM Pre-Transaction Security Firewall, Calldata Decoder & DAO Proposal Risk Auditor (Base, Ethereum, Arbitrum, Optimism)",
                 "mimeType": "application/json",
                 "discoverable": True,
-                "extra": {"name": "USDC", "version": "2"},
+                "extra": {"name": token_name, "version": "2"},
             }
         ],
         "extensions": build_bazaar_discovery_extension(endpoint),
