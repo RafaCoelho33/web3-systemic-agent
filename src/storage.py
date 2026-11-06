@@ -503,6 +503,14 @@ class AgentStorage:
             logger.warning(f"AgentStorage failed to get evaluations from {self.db_path}: {exc}")
             return []
 
+    async def get_evaluations_by_rule(
+        self, rule_id: str, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieves recent evaluations matching a specific rule_id.
+        """
+        return await self.get_evaluations(limit=limit, rule_id=rule_id)
+
     async def get_errors(
         self, limit: int = 100, stage: Optional[str] = None
     ) -> List[Dict[str, Any]]:
