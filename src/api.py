@@ -332,6 +332,26 @@ def create_app(
     app.state.x402_config = active_x402_config
     app.state.facilitator = active_facilitator
 
+    # Intercept /evaluate requests for Coinbase CDP Crawler & x402 Bazaar compliance
+    @app.middleware("http")
+    async def x402_evaluate_interceptor(request: Request, call_next):
+        if request.url.path.rstrip("/") == "/evaluate" and request.method in ("GET", "POST"):
+            x402_cfg: X402Config = getattr(app.state, "x402_config", None) or X402Config()
+            if x402_cfg.enabled:
+                payment_hdr = (
+                    request.headers.get("x-payment")
+                    or request.headers.get("payment-signature")
+                    or request.headers.get("x-payment-signature")
+                )
+                has_payment = bool(payment_hdr and payment_hdr.strip())
+                if not has_payment:
+                    return build_402_response(
+                        x402_cfg,
+                        request.url.path,
+                        x402_cfg.price_per_eval_usdc,
+                    )
+        return await call_next(request)
+
     # ---------------------------------------------------------------------
     # Standardized Exception Handlers
     # ---------------------------------------------------------------------
@@ -625,6 +645,19 @@ def create_app(
             message="Rule payload passed pre-validation successfully.",
             details=details,
             warnings=warnings,
+        )
+
+    @app.get("/evaluate", tags=["Evaluation"], summary="x402 Payment & Bazaar Discovery Metadata")
+    async def evaluate_discovery(request: Request):
+        """
+        Returns HTTP 402 Payment Required response containing x402 payment requirements
+        and Bazaar auto-discovery extensions for crawlers and discovery agents.
+        """
+        x402_cfg: X402Config = getattr(app.state, "x402_config", None) or X402Config()
+        return build_402_response(
+            x402_cfg,
+            request.url.path,
+            x402_cfg.price_per_eval_usdc,
         )
 
     @app.post("/evaluate", response_model=FinalAgentResponse, tags=["Evaluation"])

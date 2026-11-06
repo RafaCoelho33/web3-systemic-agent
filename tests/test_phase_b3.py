@@ -840,7 +840,7 @@ class TestSection4X402Module:
         assert acc["network"] == cfg.network
         assert acc["maxAmountRequired"] == "10000"
         assert acc["amount_usdc"] == 0.01
-        assert acc["asset"] == "USDC"
+        assert acc["asset"] in ("USDC", cfg.usdc_contract_address)
         assert acc["payTo"] == cfg.pay_to_address
         assert acc["resource"] == "/evaluate"
 

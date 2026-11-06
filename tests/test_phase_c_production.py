@@ -698,6 +698,83 @@ class TestPhaseCBazaarAndCDPMainnet:
         bazaar_ext = body["extensions"]["bazaar"]
         assert "info" in bazaar_ext, "Expected 'info' in extensions.bazaar"
         assert "schema" in bazaar_ext, "Expected 'schema' in extensions.bazaar"
+        assert bazaar_ext["info"]["input"]["method"] == "POST", "Expected bazaar.info.input.method to be POST"
+        assert accept_item["amount"] == "50000"
+        assert accept_item["maxAmountRequired"] == "50000"
+        assert accept_item["amount_usdc"] == 0.05
+        assert accept_item["asset"] == cfg.usdc_contract_address
+        assert accept_item["usdcAddress"] == cfg.usdc_contract_address
+        assert accept_item["maxTimeoutSeconds"] == 300
+        assert response.headers.get("X-PAYMENT-REQUIRED") == "true"
+        assert response.headers.get("Payment-Required") == "true"
+
+    def test_bazaar_fallback_without_sdk_has_method_post(self, monkeypatch):
+        """Bazaar discovery extension fallback contains method='POST' when x402 SDK is absent."""
+        import src.x402_payment as x402_mod
+        monkeypatch.setattr(x402_mod, "HAS_X402_SDK", False)
+        ext = x402_mod.build_bazaar_discovery_extension("/evaluate")
+        assert ext["bazaar"]["info"]["input"]["method"] == "POST"
+        assert ext["bazaar"]["info"]["input"]["type"] == "http"
+        assert ext["bazaar"]["info"]["input"]["bodyType"] == "json"
+
+    def test_coinbase_cdp_crawler_get_evaluate_returns_402(self, temp_storage):
+        """Coinbase CDP crawler GET /evaluate returns HTTP 402 with Bazaar discovery metadata."""
+        from src.api import create_app
+        from src.x402_payment import X402Config
+        from fastapi.testclient import TestClient
+
+        cfg = X402Config(enabled=True)
+        app = create_app(storage=temp_storage, x402_config=cfg)
+        client = TestClient(app)
+
+        resp = client.get("/evaluate")
+        assert resp.status_code == 402
+        assert resp.headers.get("X-PAYMENT-REQUIRED") == "true"
+        assert resp.headers.get("Payment-Required") == "true"
+
+        data = resp.json()
+        assert "extensions" in data
+        assert "bazaar" in data["extensions"]
+        assert data["extensions"]["bazaar"]["info"]["input"]["method"] == "POST"
+        assert data["accepts"][0]["amount"] == "10000"
+        assert data["accepts"][0]["asset"] == cfg.usdc_contract_address
+
+    def test_coinbase_cdp_crawler_post_evaluate_empty_body_returns_402(self, temp_storage):
+        """Coinbase CDP crawler POST /evaluate with empty body or no payment header returns HTTP 402, not 422."""
+        from src.api import create_app
+        from src.x402_payment import X402Config
+        from fastapi.testclient import TestClient
+
+        cfg = X402Config(enabled=True)
+        app = create_app(storage=temp_storage, x402_config=cfg)
+        client = TestClient(app)
+
+        # Empty body {} without payment headers must return 402 directly
+        resp_empty = client.post("/evaluate", json={})
+        assert resp_empty.status_code == 402
+        assert resp_empty.headers.get("X-PAYMENT-REQUIRED") == "true"
+        assert resp_empty.headers.get("Payment-Required") == "true"
+
+        # Arbitrary body without payment headers must return 402 directly
+        resp_bad = client.post("/evaluate", json={"invalid": "payload"})
+        assert resp_bad.status_code == 402
+        assert resp_bad.headers.get("X-PAYMENT-REQUIRED") == "true"
+        assert resp_bad.headers.get("Payment-Required") == "true"
+
+    def test_evaluate_post_with_payment_header_and_invalid_body_returns_422(self, temp_storage):
+        """POST /evaluate with payment header and invalid body triggers FastAPI validation and returns 422."""
+        from src.api import create_app
+        from src.x402_payment import X402Config
+        from fastapi.testclient import TestClient
+
+        cfg = X402Config(enabled=True)
+        app = create_app(storage=temp_storage, x402_config=cfg)
+        client = TestClient(app)
+
+        # With payment header present, request proceeds to schema validation
+        fake_payment_hdr = '{"payment_id": "test-pay-1", "payer_address": "0x1111111111111111111111111111111111111111", "amount_atomic": 10000, "signature": "0xvalid"}'
+        resp = client.post("/evaluate", json={"bad": "payload"}, headers={"X-PAYMENT": fake_payment_hdr})
+        assert resp.status_code == 422
 
     def test_cdp_api_key_config_and_auth_provider(self, monkeypatch):
         """X402Config recognizes CDP API keys and CDPFacilitatorAuthProvider provides auth headers."""

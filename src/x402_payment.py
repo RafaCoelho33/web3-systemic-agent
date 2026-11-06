@@ -455,7 +455,7 @@ def build_bazaar_discovery_extension(endpoint: str = "/evaluate") -> Dict[str, A
 
     if HAS_X402_SDK:
         try:
-            return declare_discovery_extension(
+            res = declare_discovery_extension(
                 input=sample_input,
                 input_schema=ConditionRulePayload.model_json_schema(),
                 body_type="json",
@@ -464,6 +464,12 @@ def build_bazaar_discovery_extension(endpoint: str = "/evaluate") -> Dict[str, A
                     schema=FinalAgentResponse.model_json_schema(),
                 ),
             )
+            if isinstance(res, dict) and "bazaar" in res:
+                if isinstance(res["bazaar"], dict) and "info" in res["bazaar"]:
+                    if isinstance(res["bazaar"]["info"], dict) and "input" in res["bazaar"]["info"]:
+                        if isinstance(res["bazaar"]["info"]["input"], dict):
+                            res["bazaar"]["info"]["input"]["method"] = "POST"
+            return res
         except Exception as exc:
             logger.warning("Failed to generate bazaar discovery extension via SDK: %s", exc)
 
@@ -472,6 +478,7 @@ def build_bazaar_discovery_extension(endpoint: str = "/evaluate") -> Dict[str, A
             "info": {
                 "input": {
                     "type": "http",
+                    "method": "POST",
                     "bodyType": "json",
                     "body": sample_input,
                 },
@@ -1212,11 +1219,13 @@ def build_402_response(
             {
                 "scheme": "exact",
                 "network": config.network,
+                "amount": str(required_atomic),
                 "maxAmountRequired": str(required_atomic),
                 "amount_usdc": round(required_usdc, 6),
-                "asset": config.asset,
+                "asset": config.usdc_contract_address,
                 "usdcAddress": config.usdc_contract_address,
                 "payTo": config.pay_to_address,
+                "maxTimeoutSeconds": 300,
                 "resource": endpoint,
                 "description": f"Web3 Security & Governance Audit for {endpoint} — EVM Pre-Transaction Security Firewall, Calldata Decoder & DAO Proposal Risk Auditor (Base, Ethereum, Arbitrum, Optimism)",
                 "mimeType": "application/json",
@@ -1229,5 +1238,5 @@ def build_402_response(
     return JSONResponse(
         status_code=402,
         content=body,
-        headers={"X-PAYMENT-REQUIRED": "true"},
+        headers={"X-PAYMENT-REQUIRED": "true", "Payment-Required": "true"},
     )
