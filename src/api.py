@@ -20,7 +20,8 @@ from typing import Dict, Any, Optional, List, Union
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT_DIR = os.path.abspath(os.path.join(_CURRENT_DIR, "..")) if os.path.basename(_CURRENT_DIR) == "src" else _CURRENT_DIR
 _SRC_DIR = os.path.join(_ROOT_DIR, "src")
-for _p in (_ROOT_DIR, _SRC_DIR):
+_SCRIPTS_DIR = os.path.join(_ROOT_DIR, "scripts")
+for _p in (_ROOT_DIR, _SRC_DIR, _SCRIPTS_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -30,6 +31,25 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from web3 import AsyncWeb3, AsyncHTTPProvider
+
+try:
+    from scripts.block_contract_scanner import (
+        get_latest_block_number,
+        scan_recent_blocks,
+        audit_discovered_contracts,
+    )
+except ImportError:
+    try:
+        from block_contract_scanner import (
+            get_latest_block_number,
+            scan_recent_blocks,
+            audit_discovered_contracts,
+        )
+    except ImportError:
+        get_latest_block_number = None
+        scan_recent_blocks = None
+        audit_discovered_contracts = None
 
 try:
     from src.schemas import (
@@ -180,8 +200,71 @@ class RuleValidationResponse(BaseModel):
 
 
 # -------------------------------------------------------------------------
-# Application Factory
+# Application Factory & Background Workers
 # -------------------------------------------------------------------------
+
+async def _background_scanner_worker(app_instance: FastAPI):
+    """
+    Background worker that continuously scans newly produced blocks on Base Mainnet
+    for smart contract deployments and executes deterministic and semantic security audits.
+    """
+    rpc_url = os.getenv("RPC_URL_8453", "https://mainnet.base.org")
+    w3 = getattr(app_instance.state, "scanner_w3", None) or AsyncWeb3(AsyncHTTPProvider(rpc_url))
+    last_scanned_block: Optional[int] = None
+    poll_interval = 5.0
+    limit = 5
+
+    logger.info("Background block contract scanner worker started on Base Mainnet (%s)", rpc_url)
+    try:
+        while True:
+            try:
+                if get_latest_block_number is None or scan_recent_blocks is None or audit_discovered_contracts is None:
+                    logger.warning("Block contract scanner functions unavailable. Sleeping...")
+                    await asyncio.sleep(poll_interval)
+                    continue
+
+                current_block = await get_latest_block_number(w3)
+                if last_scanned_block is None:
+                    blocks_to_check = 1
+                    start_b = current_block
+                elif current_block > last_scanned_block:
+                    blocks_to_check = min(current_block - last_scanned_block, 10)
+                    start_b = current_block
+                else:
+                    await asyncio.sleep(poll_interval)
+                    continue
+
+                discovered = await scan_recent_blocks(
+                    w3=w3,
+                    num_blocks=blocks_to_check,
+                    limit=limit,
+                    start_block=start_b,
+                )
+
+                if discovered:
+                    active_eng = getattr(app_instance.state, "engine", None)
+                    if active_eng is not None:
+                        await audit_discovered_contracts(discovered, active_eng, rpc_url=rpc_url)
+
+                last_scanned_block = current_block
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Transient error in background block scanner worker: %s", exc)
+
+            await asyncio.sleep(poll_interval)
+
+    except asyncio.CancelledError:
+        logger.info("Background block scanner worker received cancellation. Shutting down gracefully.")
+    finally:
+        if hasattr(w3, "provider") and hasattr(w3.provider, "disconnect"):
+            try:
+                await w3.provider.disconnect()
+            except Exception:
+                pass
+        app_instance.state.scanner_active = False
+
 
 def create_app(
     engine: Optional[ConditionAgentEngine] = None,
@@ -190,6 +273,7 @@ def create_app(
     facilitator: Optional[Any] = None,
     rate_limit_per_minute: Optional[int] = None,
     public_evaluate_only: Optional[bool] = None,
+    enable_background_scanner: Optional[bool] = None,
 ) -> FastAPI:
     """
     Creates and configures the FastAPI application instance.
@@ -204,9 +288,38 @@ def create_app(
             in ("true", "1", "yes")
         )
 
+    if enable_background_scanner is not None:
+        effective_enable_scanner = bool(enable_background_scanner)
+    else:
+        env_scanner = os.getenv("ENABLE_BACKGROUND_SCANNER")
+        if env_scanner is not None:
+            effective_enable_scanner = env_scanner.strip().lower() in ("true", "1", "yes")
+        else:
+            effective_enable_scanner = bool(os.getenv("RENDER"))
+
     @asynccontextmanager
     async def lifespan(app_instance: FastAPI):
+        if effective_enable_scanner:
+            app_instance.state.scanner_active = True
+            app_instance.state.scanner_task = asyncio.create_task(
+                _background_scanner_worker(app_instance)
+            )
+        else:
+            app_instance.state.scanner_active = False
+            app_instance.state.scanner_task = None
+
         yield
+
+        if hasattr(app_instance.state, "scanner_task") and app_instance.state.scanner_task:
+            app_instance.state.scanner_task.cancel()
+            try:
+                await app_instance.state.scanner_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.warning(f"Error during scanner task cancellation: {exc}")
+            app_instance.state.scanner_active = False
+
         if hasattr(app_instance.state, "worker_pool") and app_instance.state.worker_pool:
             await app_instance.state.worker_pool.shutdown()
 
@@ -335,6 +448,8 @@ def create_app(
     )
     app.state.x402_config = active_x402_config
     app.state.facilitator = active_facilitator
+    app.state.scanner_active = False
+    app.state.scanner_task = None
 
     # Intercept /evaluate requests for Coinbase CDP Crawler & x402 Bazaar compliance
     @app.middleware("http")
@@ -1186,7 +1301,9 @@ def create_app(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Storage not configured on application state",
             )
-        return await storage_inst.get_summary_metrics(target_price_usd=target_price)
+        metrics = await storage_inst.get_summary_metrics(target_price_usd=target_price)
+        metrics["background_scanner_active"] = bool(getattr(app.state, "scanner_active", False))
+        return metrics
 
     @app.get("/logs/errors", tags=["Monitoring"])
     async def get_error_logs(limit: int = 50, stage: Optional[str] = None):
