@@ -845,7 +845,7 @@ class TestSection4X402Module:
         assert acc["amount_usdc"] == 0.01
         assert acc["asset"] in ("USDC", cfg.usdc_contract_address)
         assert acc["payTo"] == cfg.pay_to_address
-        assert acc["resource"] == "/evaluate"
+        assert acc["resource"] == "/evaluate" or (isinstance(acc["resource"], dict) and acc["resource"]["url"].endswith("/evaluate"))
 
 
 # =============================================================================

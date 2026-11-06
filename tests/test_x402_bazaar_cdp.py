@@ -421,10 +421,19 @@ def simulate_cdp_validator(
     )
 
     # Check 18: accepts[0].resource matches endpoint
-    resource_val = first_accept.get("resource", "")
+    # Supports both object format (new Bazaar standard: {"url": "..."}) and legacy string format
+    resource_val = first_accept.get("resource")
+    if (resource_val is None or resource_val == "") and is_dict:
+        resource_val = body.get("resource", "")
+
+    if isinstance(resource_val, dict):
+        resource_str = resource_val.get("url", "")
+    else:
+        resource_str = str(resource_val) if resource_val else ""
+
     resource_valid = bool(
-        isinstance(resource_val, str)
-        and (resource_val == url or url.endswith(resource_val))
+        resource_str
+        and (resource_str == url or resource_str.endswith(url) or url.endswith(resource_str))
     )
     add_check(
         18, "accepts_0_resource_declared", "accepts", "required",
@@ -569,6 +578,26 @@ class TestX402BazaarCDPConformance:
         assert bazaar_ext["info"]["input"]["method"] == "POST"
         assert bazaar_ext["info"]["input"]["type"] == "http"
 
+        # Resource object assertions (Bazaar standard)
+        assert "resource" in body, "Response body must contain 'resource'"
+        assert isinstance(body["resource"], dict), "body['resource'] must be a dictionary object"
+        assert "url" in body["resource"], "body['resource'] must contain 'url'"
+        assert body["resource"]["url"].startswith("https://"), (
+            f"body['resource']['url'] must be a complete HTTPS URL, got '{body['resource']['url']}'"
+        )
+        assert body["resource"]["url"].endswith("/evaluate")
+
+        # accepts[0]["resource"] assertions
+        first_acc = body["accepts"][0]
+        assert "resource" in first_acc, "accepts[0] must contain 'resource'"
+        if isinstance(first_acc["resource"], dict):
+            assert "url" in first_acc["resource"]
+            assert first_acc["resource"]["url"].startswith("https://")
+            assert first_acc["resource"]["url"].endswith("/evaluate")
+        else:
+            assert isinstance(first_acc["resource"], str)
+            assert first_acc["resource"] == "/evaluate" or first_acc["resource"].endswith("/evaluate")
+
     def test_post_evaluate_empty_probe_returns_402_not_422(
         self, test_client: TestClient
     ):
@@ -595,6 +624,12 @@ class TestX402BazaarCDPConformance:
         assert len(body["accepts"]) > 0
         assert body["accepts"][0]["scheme"] == "exact"
         assert "amount" in body["accepts"][0]
+
+        # Resource assertions
+        assert "resource" in body
+        assert isinstance(body["resource"], dict)
+        assert body["resource"]["url"].startswith("https://")
+        assert body["resource"]["url"].endswith("/evaluate")
 
     def test_post_evaluate_with_payment_and_invalid_body_returns_422(
         self, test_client: TestClient
@@ -667,6 +702,26 @@ class TestX402BazaarCDPConformance:
         # maxTimeoutSeconds == 300
         assert "maxTimeoutSeconds" in acc, "Missing 'maxTimeoutSeconds' in accepts[0]"
         assert acc["maxTimeoutSeconds"] == 300, f"Expected 300, got {acc['maxTimeoutSeconds']}"
+
+        # Resource validations (Bazaar resource object standard)
+        assert "resource" in body, "Missing top-level 'resource' in 402 body"
+        assert isinstance(body["resource"], dict), "body['resource'] must be a dict"
+        assert "url" in body["resource"], "body['resource'] missing 'url'"
+        assert body["resource"]["url"].startswith("https://"), (
+            f"body['resource']['url'] must be a complete HTTPS URL, got '{body['resource']['url']}'"
+        )
+        assert body["resource"]["url"].endswith("/evaluate")
+
+        assert "resource" in acc, "Missing 'resource' in accepts[0]"
+        if isinstance(acc["resource"], dict):
+            assert "url" in acc["resource"], "Missing 'url' in accepts[0]['resource']"
+            assert acc["resource"]["url"].startswith("https://"), (
+                f"accepts[0]['resource']['url'] must be a complete HTTPS URL, got '{acc['resource']['url']}'"
+            )
+            assert acc["resource"]["url"].endswith("/evaluate")
+        else:
+            assert isinstance(acc["resource"], str)
+            assert acc["resource"] == "/evaluate" or acc["resource"].endswith("/evaluate")
 
         # 2. extensions.bazaar validations
         bazaar = body["extensions"]["bazaar"]
@@ -815,6 +870,52 @@ class TestX402BazaarCDPConformance:
         assert any(c["name"] == "x402_version" and not c["passed"] for c in res_bad_ver["checks"])
         ver_check = next(c for c in res_bad_ver["checks"] if c["name"] == "x402_version")
         assert "upgrade to x402 v2 to be discoverable in the bazaar" in ver_check["details"]
+
+        # Anomaly 8: Resource missing or URL not matching endpoint
+        bad_resource_body = json.loads(json.dumps(valid_body))
+        bad_resource_body["accepts"][0]["resource"] = {"url": "https://other-domain.com/unrelated"}
+        if "resource" in bad_resource_body:
+            bad_resource_body["resource"] = {"url": "https://other-domain.com/unrelated"}
+        res_bad_res = simulate_cdp_validator(bad_resource_body, url="/evaluate")
+        assert res_bad_res["valid"] is False
+        assert any(c["name"] == "accepts_0_resource_declared" and not c["passed"] for c in res_bad_res["checks"])
+
+        # Anomaly 9: Resource object missing or empty 'url'
+        bad_res_empty = json.loads(json.dumps(valid_body))
+        bad_res_empty["accepts"][0]["resource"] = {}
+        if "resource" in bad_res_empty:
+            del bad_res_empty["resource"]
+        res_bad_empty = simulate_cdp_validator(bad_res_empty, url="/evaluate")
+        assert res_bad_empty["valid"] is False
+        assert any(c["name"] == "accepts_0_resource_declared" and not c["passed"] for c in res_bad_empty["checks"])
+
+    def test_resource_url_is_complete_https_and_matches_endpoint(
+        self, test_client: TestClient
+    ):
+        """
+        Validates that body['resource']['url'] is a complete HTTPS URL,
+        and that accepts[0]['resource'] correctly references the endpoint.
+        """
+        resp = test_client.get("/evaluate")
+        assert resp.status_code == 402
+        body = resp.json()
+        assert "resource" in body
+        assert isinstance(body["resource"], dict)
+        res = body["resource"]
+        assert "url" in res
+        assert res["url"].startswith("https://")
+        assert res["url"].endswith("/evaluate")
+        assert "description" in res
+        assert "mimeType" in res
+        assert res["mimeType"] == "application/json"
+
+        first_acc = body["accepts"][0]
+        assert "resource" in first_acc
+        if isinstance(first_acc["resource"], dict):
+            assert first_acc["resource"]["url"].startswith("https://")
+            assert first_acc["resource"]["url"].endswith("/evaluate")
+        else:
+            assert first_acc["resource"] == "/evaluate" or first_acc["resource"].endswith("/evaluate")
 
     def test_bazaar_fallback_fidelity_without_x402_sdk(self, monkeypatch):
         """

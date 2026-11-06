@@ -1211,10 +1211,21 @@ def build_402_response(
     """
     required_atomic = usdc_to_atomic(required_usdc)
     token_name = "USD Coin" if config.network == "eip155:8453" else "USDC"
+    full_resource_url = (
+        endpoint
+        if endpoint.startswith("http://") or endpoint.startswith("https://")
+        else f"https://web3-systemic-agent.onrender.com{endpoint if endpoint.startswith('/') else '/' + endpoint}"
+    )
+    resource_obj = {
+        "url": full_resource_url,
+        "description": f"Web3 Security & Governance Audit for {endpoint} — EVM Pre-Transaction Security Firewall, Calldata Decoder & DAO Proposal Risk Auditor (Base, Ethereum, Arbitrum, Optimism)",
+        "mimeType": "application/json",
+    }
     body = {
         "x402Version": 2,
         "error": "PaymentRequired",
         "message": reason,
+        "resource": resource_obj,
         "accepts": [
             {
                 "scheme": "exact",
@@ -1226,8 +1237,9 @@ def build_402_response(
                 "usdcAddress": config.usdc_contract_address,
                 "payTo": config.pay_to_address,
                 "maxTimeoutSeconds": 300,
-                "resource": endpoint,
-                "description": f"Web3 Security & Governance Audit for {endpoint} — EVM Pre-Transaction Security Firewall, Calldata Decoder & DAO Proposal Risk Auditor (Base, Ethereum, Arbitrum, Optimism)",
+                "resource": resource_obj,
+                "url": full_resource_url,
+                "description": resource_obj["description"],
                 "mimeType": "application/json",
                 "discoverable": True,
                 "extra": {"name": token_name, "version": "2"},
