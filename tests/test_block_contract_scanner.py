@@ -551,3 +551,97 @@ def test_parse_args_options():
     assert args_custom.dry_run is True
     assert args_custom.continuous is True
     assert args_custom.rpc_url == "https://custom.rpc"
+
+
+# ============================================================================
+# Stage 1 LLM Gatekeeping & High Risk Filtering Tests
+# ============================================================================
+
+
+def test_create_deployment_rule_payload_require_high_risk_for_llm():
+    """
+    Validates Stage 1 LLM gatekeeping:
+    - When selectors only contains benign ERC-20 selectors (transfer, approve, balanceOf)
+      and require_high_risk_for_llm=True, verify payload.semantic.enabled is False.
+    - When selectors contains transferOwnership(address) and require_high_risk_for_llm=True,
+      verify payload.semantic.enabled is True.
+    """
+    benign_selectors = [
+        {"selector": "0xa9059cbb", "signature": "transfer(address,uint256)"},
+        {"selector": "0x095ea7b3", "signature": "approve(address,uint256)"},
+        {"selector": "0x70a08231", "signature": "balanceOf(address)"},
+    ]
+
+    payload_benign = create_deployment_rule_payload(
+        contract_address="0x1111111111111111111111111111111111111111",
+        tx_hash="0x" + "11" * 32,
+        block_number=1000,
+        deployer="0x2222222222222222222222222222222222222222",
+        selectors=benign_selectors,
+        bytecode_length=200,
+        require_high_risk_for_llm=True,
+    )
+    assert payload_benign.semantic.enabled is False
+
+    high_risk_selectors = [
+        {"selector": "0xa9059cbb", "signature": "transfer(address,uint256)"},
+        {"selector": "0xf2fde38b", "signature": "transferOwnership(address)"},
+    ]
+    payload_high_risk = create_deployment_rule_payload(
+        contract_address="0x1111111111111111111111111111111111111111",
+        tx_hash="0x" + "22" * 32,
+        block_number=1001,
+        deployer="0x2222222222222222222222222222222222222222",
+        selectors=high_risk_selectors,
+        bytecode_length=350,
+        require_high_risk_for_llm=True,
+    )
+    assert payload_high_risk.semantic.enabled is True
+
+
+@pytest.mark.asyncio
+async def test_audit_discovered_contracts_skips_llm_for_benign_when_high_risk_required(tmp_path):
+    """
+    Validates that audit_discovered_contracts skips LLM evaluation (llm_invoked=False)
+    for benign contracts when require_high_risk_for_llm=True, recommends APPROVE,
+    and produces exactly 1 storage record without duplicate writes.
+    """
+    db_file = str(tmp_path / "benign_audit.db")
+    storage = AgentStorage(db_path=db_file)
+    evaluator = MockSemanticEvaluator()
+    engine = ConditionAgentEngine(
+        rpc_url=DEFAULT_BASE_RPC,
+        semantic_evaluator=evaluator,
+        storage=storage,
+    )
+
+    # Benign bytecode containing only the transfer selector (0xa9059cbb)
+    benign_bytecode = bytes.fromhex("608060405234801561001057600080fd5b508063a9059cbb14")
+    contract_addr = "0x3333333333333333333333333333333333333333"
+
+    discovered = [
+        {
+            "block_number": 23419500,
+            "tx_hash": "0x" + "33" * 32,
+            "contract_address": contract_addr,
+            "deployer": "0x4444444444444444444444444444444444444444",
+            "bytecode": benign_bytecode,
+            "tx_input": "0x",
+        }
+    ]
+
+    results = await audit_discovered_contracts(
+        contracts=discovered,
+        engine=engine,
+        require_high_risk_for_llm=True,
+    )
+
+    assert len(results) == 1
+    resp = results[0]["response"]
+    assert isinstance(resp, FinalAgentResponse)
+    assert resp.llm_invoked is False
+    assert results[0]["recommendation"] == "APPROVE"
+
+    persisted = await storage.get_evaluations(rule_id=results[0]["payload"].rule_id)
+    assert len(persisted) == 1
+

@@ -1752,3 +1752,213 @@ class TestFastAPIConcurrencyEndpoints:
         assert response.status_code == 404
 
 
+# =========================================================================
+# 10. Gemini 429 RESOURCE_EXHAUSTED Quota Failover and Model Cooldown Tests
+# =========================================================================
+
+class TestGemini429QuotaFailoverAndCooldown:
+    """
+    Validates Gemini 429 RESOURCE_EXHAUSTED failover mechanism, retryDelay / backoff
+    delay string parsing, per-model cooldown tracking, and graceful fallback to mock.
+    """
+
+    def test_parse_retry_delay_seconds_variants(self):
+        """
+        Validates parsing of various 429 error formats and rate limit header/body delay strings:
+        - 'retryDelay': '23471s' -> returns 23471.0
+        - 'Please retry in 6h31m11.5s.' -> returns 6*3600 + 31*60 + 11.5 (23471.5)
+        - 'GenerateRequestsPerDayPerProjectPerModel-FreeTier' without explicit delay -> returns 3600.0
+        - Generic 429 string -> returns default 60.0
+        """
+        import src.semantic_evaluator as sem_mod
+        parse_fn = getattr(sem_mod, "parse_retry_delay_seconds", None)
+        if parse_fn is None:
+            from src.semantic_evaluator import parse_retry_delay_seconds as parse_fn
+
+        # Variant 1: explicit retryDelay in seconds string
+        err_delay_sec = (
+            "429 RESOURCE_EXHAUSTED: Quota exceeded for quota metric 'Generate Requests'. "
+            "{'error': {'code': 429, 'details': [{'@type': 'type.googleapis.com/google.rpc.RetryInfo', 'retryDelay': '23471s'}]}}"
+        )
+        assert parse_fn(err_delay_sec) == 23471.0
+
+        # Variant 2: compound time string (hours, minutes, seconds)
+        err_hms = "429 RESOURCE_EXHAUSTED: Quota exceeded. Please retry in 6h31m11.5s. Resource has been exhausted."
+        expected_hms = 6 * 3600 + 31 * 60 + 11.5
+        assert parse_fn(err_hms) == expected_hms
+
+        # Variant 3: FreeTier daily quota exceeded without explicit delay (3600.0s cooldown default)
+        err_free_tier = (
+            "429 RESOURCE_EXHAUSTED: Quota exceeded for metric "
+            "'GenerateRequestsPerDayPerProjectPerModel-FreeTier' of service 'generativelanguage.googleapis.com'."
+        )
+        assert parse_fn(err_free_tier) == 3600.0
+
+        # Variant 4: generic 429 error message without specific hints (default 60s cooldown)
+        err_generic = "429 RESOURCE_EXHAUSTED: Rate limit reached. Please reduce request rate."
+        assert parse_fn(err_generic) == 60.0
+
+    @pytest.mark.asyncio
+    async def test_gemini_429_resource_exhausted_failover_to_next_model(self):
+        """
+        Validates that when the primary model encounters a 429 RESOURCE_EXHAUSTED error,
+        it automatically switches to the alternative candidate model (gemini-3.1-flash-lite),
+        registers the exhausted model into _model_cooldown_until, and succeeds.
+        """
+        import time
+        from schemas import LLMAuditOutput, SemanticCondition, SemanticAuditResult
+
+        class FakeGenAIClient:
+            def __init__(self):
+                self.calls = []
+                self.aio = self._Aio(self)
+
+            class _Aio:
+                def __init__(self, outer):
+                    self.models = self._Models(outer)
+
+                class _Models:
+                    def __init__(self, outer):
+                        self._outer = outer
+
+                    async def generate_content(self, model: str, contents: str, config=None):
+                        self._outer.calls.append(model)
+                        if model == "gemini-3.5-flash-lite":
+                            raise RuntimeError(
+                                "429 RESOURCE_EXHAUSTED: Quota exceeded for quota metric "
+                                "'Generate Requests' {'retryDelay': '23471s'}"
+                            )
+                        return LLMAuditOutput(
+                            conditions_met=False,
+                            risk_score=1.5,
+                            flagged_issues=[],
+                            summary="Audit passed cleanly on fallback candidate model.",
+                            recommended_action="APPROVE",
+                        )
+
+        fake_client = FakeGenAIClient()
+        evaluator = GeminiSemanticEvaluator(
+            api_key="test-key",
+            model_name="gemini-3.5-flash-lite",
+            client=fake_client,
+            fallback_to_mock=False,
+        )
+
+        condition = SemanticCondition(policy_prompt="Audit treasury transfer.", risk_threshold=7.0)
+        observed = {"calldata_analysis": {"signature": "transfer(address,uint256)"}}
+        metadata = {"proposal_description": "Approved vendor disbursement"}
+
+        res = await evaluator.evaluate(condition, observed, metadata)
+
+        assert res.model == "gemini-3.1-flash-lite"
+        assert fake_client.calls == ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+        assert hasattr(evaluator, "_model_cooldown_until")
+        assert "gemini-3.5-flash-lite" in evaluator._model_cooldown_until
+        assert evaluator._model_cooldown_until["gemini-3.5-flash-lite"] > time.monotonic()
+
+    @pytest.mark.asyncio
+    async def test_gemini_cooldown_skips_exhausted_model_on_subsequent_calls(self):
+        """
+        Validates that subsequent calls skip the exhausted model while in active cooldown,
+        invoking the fallback model directly without attempting the cooled-down model.
+        """
+        from schemas import LLMAuditOutput, SemanticCondition
+
+        class FakeGenAIClient:
+            def __init__(self):
+                self.calls = []
+                self.aio = self._Aio(self)
+
+            class _Aio:
+                def __init__(self, outer):
+                    self.models = self._Models(outer)
+
+                class _Models:
+                    def __init__(self, outer):
+                        self._outer = outer
+
+                    async def generate_content(self, model: str, contents: str, config=None):
+                        self._outer.calls.append(model)
+                        if model == "gemini-3.5-flash-lite":
+                            raise RuntimeError(
+                                "429 RESOURCE_EXHAUSTED: Rate limit exceeded {'retryDelay': '23471s'}"
+                            )
+                        return LLMAuditOutput(
+                            conditions_met=False,
+                            risk_score=1.5,
+                            flagged_issues=[],
+                            summary="Audit passed on fallback candidate.",
+                            recommended_action="APPROVE",
+                        )
+
+        fake_client = FakeGenAIClient()
+        evaluator = GeminiSemanticEvaluator(
+            api_key="test-key",
+            model_name="gemini-3.5-flash-lite",
+            client=fake_client,
+            fallback_to_mock=False,
+        )
+
+        cond1 = SemanticCondition(policy_prompt="First evaluation prompt", risk_threshold=7.0)
+        res1 = await evaluator.evaluate(cond1, {"nonce": 1}, {"proposal_description": "Initial proposal"})
+        assert res1.model == "gemini-3.1-flash-lite"
+        assert fake_client.calls == ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+
+        # Clear logged calls to track subsequent invocation behavior
+        fake_client.calls.clear()
+
+        # Invoke second evaluation with different condition/metadata to bypass semantic cache
+        cond2 = SemanticCondition(policy_prompt="Second distinct evaluation prompt", risk_threshold=6.0)
+        res2 = await evaluator.evaluate(cond2, {"nonce": 2}, {"proposal_description": "Subsequent proposal"})
+
+        assert res2.model == "gemini-3.1-flash-lite"
+        assert fake_client.calls == ["gemini-3.1-flash-lite"]
+
+    @pytest.mark.asyncio
+    async def test_gemini_all_models_exhausted_falls_back_to_mock(self):
+        """
+        Validates that when all candidate models raise 429 RESOURCE_EXHAUSTED and fallback_to_mock=True,
+        evaluator falls back gracefully to MockSemanticEvaluator, records LLM provider failure flag,
+        and escalates APPROVE to MANUAL_REVIEW.
+        """
+        from schemas import SemanticCondition, SemanticAuditResult
+
+        class AllExhaustedGenAIClient:
+            def __init__(self):
+                self.calls = []
+                self.aio = self._Aio(self)
+
+            class _Aio:
+                def __init__(self, outer):
+                    self.models = self._Models(outer)
+
+                class _Models:
+                    def __init__(self, outer):
+                        self._outer = outer
+
+                    async def generate_content(self, model: str, contents: str, config=None):
+                        self._outer.calls.append(model)
+                        raise RuntimeError(
+                            f"429 RESOURCE_EXHAUSTED: Model {model} quota completely exhausted."
+                        )
+
+        fake_client = AllExhaustedGenAIClient()
+        evaluator = GeminiSemanticEvaluator(
+            api_key="test-key",
+            model_name="gemini-3.5-flash-lite",
+            client=fake_client,
+            fallback_to_mock=True,
+        )
+
+        condition = SemanticCondition(policy_prompt="Benign check", risk_threshold=7.0)
+        observed = {"calldata_analysis": {"signature": "transfer(address,uint256)"}}
+        metadata = {"proposal_description": "Routine audited transfer"}
+
+        res = await evaluator.evaluate(condition, observed, metadata)
+
+        assert isinstance(res, SemanticAuditResult)
+        assert any("LLM provider failure (Gemini)" in str(issue) for issue in res.flagged_issues)
+        assert res.recommended_action == "MANUAL_REVIEW"
+
+
+

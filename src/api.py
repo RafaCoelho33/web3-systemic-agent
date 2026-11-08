@@ -211,8 +211,18 @@ async def _background_scanner_worker(app_instance: FastAPI):
     rpc_url = os.getenv("RPC_URL_8453", "https://mainnet.base.org")
     w3 = getattr(app_instance.state, "scanner_w3", None) or AsyncWeb3(AsyncHTTPProvider(rpc_url))
     last_scanned_block: Optional[int] = None
-    poll_interval = 5.0
-    limit = 5
+    try:
+        poll_interval = float(os.getenv("SCANNER_POLL_INTERVAL_SECONDS", "60.0"))
+    except (ValueError, TypeError):
+        poll_interval = 60.0
+
+    try:
+        limit = int(os.getenv("SCANNER_CONTRACT_LIMIT", "2"))
+    except (ValueError, TypeError):
+        limit = 2
+
+    require_high_risk_str = os.getenv("SCANNER_REQUIRE_HIGH_RISK_FOR_LLM", "true").strip().lower()
+    require_high_risk = require_high_risk_str in ("true", "1", "yes")
 
     logger.info("Background block contract scanner worker started on Base Mainnet (%s)", rpc_url)
     try:
@@ -244,7 +254,15 @@ async def _background_scanner_worker(app_instance: FastAPI):
                 if discovered:
                     active_eng = getattr(app_instance.state, "engine", None)
                     if active_eng is not None:
-                        await audit_discovered_contracts(discovered, active_eng, rpc_url=rpc_url)
+                        try:
+                            await audit_discovered_contracts(
+                                discovered,
+                                active_eng,
+                                rpc_url=rpc_url,
+                                require_high_risk_for_llm=require_high_risk,
+                            )
+                        except TypeError:
+                            await audit_discovered_contracts(discovered, active_eng, rpc_url=rpc_url)
 
                 last_scanned_block = current_block
 

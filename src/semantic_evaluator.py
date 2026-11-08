@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import time
 from typing import Dict, Any, Optional, Protocol, Union
@@ -191,6 +192,7 @@ def get_llm_max_input_chars(override: Optional[int] = None) -> int:
 MODEL_PRICING_PER_1M: Dict[str, tuple[float, float]] = {
     "gemini-2.0-flash": (0.10, 0.40),
     "gemini-2.5-flash": (0.30, 2.50),
+    "gemini-2.5-flash-lite": (0.075, 0.30),
     "gemini-1.5-flash": (0.075, 0.30),
     "gemini-3.5-flash-lite": (0.075, 0.30),
     "gemini-3.1-flash-lite": (0.075, 0.30),
@@ -200,6 +202,42 @@ MODEL_PRICING_PER_1M: Dict[str, tuple[float, float]] = {
     "mock": (0.0, 0.0),
 }
 DEFAULT_PRICING_PER_1M: tuple[float, float] = (0.30, 1.20)
+
+DEFAULT_GEMINI_FAILOVER_MODELS: tuple[str, ...] = (
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+)
+
+
+def parse_retry_delay_seconds(exc_str: str, default_cooldown: float = 60.0) -> float:
+    """
+    Parses rate limit / quota retry delay from exception messages.
+    Supports formats like 'retryDelay': '23471s' and 'retry in 6h31m11.49s'.
+    Falls back to 3600.0s for PerDay / free_tier_requests quotas, or default_cooldown.
+    """
+    m_delay = re.search(r"['\"]retryDelay['\"]\s*:\s*['\"](\d+(?:\.\d+)?)s['\"]", exc_str)
+    if m_delay:
+        try:
+            return float(m_delay.group(1))
+        except (ValueError, TypeError):
+            pass
+
+    m_retry = re.search(r"retry in (?:(\d+)h)?(?:(\d+)m)?(\d+(?:\.\d+)?)s", exc_str, re.IGNORECASE)
+    if m_retry:
+        try:
+            h = float(m_retry.group(1)) if m_retry.group(1) else 0.0
+            m_val = float(m_retry.group(2)) if m_retry.group(2) else 0.0
+            s = float(m_retry.group(3)) if m_retry.group(3) else 0.0
+            return h * 3600.0 + m_val * 60.0 + s
+        except (ValueError, TypeError):
+            pass
+
+    if "PerDay" in exc_str or "free_tier_requests" in exc_str:
+        return 3600.0
+
+    return default_cooldown
 
 
 def estimate_llm_cost_usd(
@@ -569,6 +607,7 @@ class GeminiSemanticEvaluator:
         temperature: float = 0.1,
         client: Optional[Any] = None,
         max_input_chars: Optional[int] = None,
+        failover_models: Optional[list[str]] = None,
         **kwargs: Any,
     ):
         resolved_key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
@@ -588,6 +627,20 @@ class GeminiSemanticEvaluator:
         self.max_input_chars = max_input_chars
         self._cache: Dict[str, SemanticAuditResult] = {}
         self.cache_hits: int = 0
+        self._model_cooldown_until: Dict[str, float] = {}
+
+        if failover_models is not None:
+            self.failover_models = list(failover_models)
+        elif "failover_models" in kwargs and kwargs["failover_models"] is not None:
+            self.failover_models = list(kwargs.pop("failover_models"))
+        elif os.getenv("GEMINI_FAILOVER_MODELS"):
+            self.failover_models = [
+                m.strip()
+                for m in os.getenv("GEMINI_FAILOVER_MODELS", "").split(",")
+                if m.strip()
+            ]
+        else:
+            self.failover_models = list(DEFAULT_GEMINI_FAILOVER_MODELS)
 
         if client is not None:
             self.client = client
@@ -614,6 +667,27 @@ class GeminiSemanticEvaluator:
     def model(self) -> str:
         """Alias property for backward compatibility with evaluators exposing .model"""
         return self.model_name
+
+    def get_candidate_models(self, now: Optional[float] = None) -> list[str]:
+        """
+        Constructs an ordered unique list starting with self.model_name followed by
+        any failover models not matching self.model_name.
+        Filters out models where cooldown has not expired.
+        If all models are in cooldown, returns the single model whose cooldown expires earliest.
+        """
+        all_candidates: list[str] = [self.model_name]
+        for m in self.failover_models:
+            if m != self.model_name and m not in all_candidates:
+                all_candidates.append(m)
+
+        current_time = now if now is not None else time.monotonic()
+        available = [
+            m for m in all_candidates
+            if self._model_cooldown_until.get(m, 0.0) <= current_time
+        ]
+        if not available:
+            return [min(all_candidates, key=lambda m: self._model_cooldown_until.get(m, 0.0))]
+        return available
 
     async def evaluate(
         self,
@@ -663,36 +737,54 @@ class GeminiSemanticEvaluator:
                 config = config_kwargs
 
             used_model = self.model_name
-            try:
+            is_mock = hasattr(self.client, "_mock_name") or hasattr(
+                getattr(self.client, "aio", None), "_mock_name"
+            )
+            if is_mock:
                 response = await self.client.aio.models.generate_content(
                     model=self.model_name,
                     contents=prompt,
                     config=config,
                 )
-            except Exception as initial_exc:
-                exc_str = str(initial_exc)
-                is_mock = hasattr(self.client, "_mock_name") or hasattr(
-                    getattr(self.client, "aio", None), "_mock_name"
-                )
-                if not is_mock and any(
-                    err_code in exc_str for err_code in ("503", "UNAVAILABLE", "404", "NOT_FOUND")
-                ):
-                    alt_model = (
-                        "gemini-3.5-flash-lite"
-                        if self.model_name != "gemini-3.5-flash-lite"
-                        else "gemini-3.1-flash-lite"
-                    )
-                    logger.warning(
-                        f"Gemini model '{self.model_name}' encountered error ({initial_exc}). Retrying once with failover model '{alt_model}'."
-                    )
-                    used_model = alt_model
-                    response = await self.client.aio.models.generate_content(
-                        model=alt_model,
-                        contents=prompt,
-                        config=config,
-                    )
-                else:
-                    raise
+            else:
+                candidates = self.get_candidate_models()
+                used_model = candidates[0]
+                response = None
+                for idx, candidate_model in enumerate(candidates):
+                    is_last = (idx == len(candidates) - 1)
+                    try:
+                        response = await self.client.aio.models.generate_content(
+                            model=candidate_model,
+                            contents=prompt,
+                            config=config,
+                        )
+                        used_model = candidate_model
+                        break
+                    except Exception as initial_exc:
+                        exc_str = str(initial_exc)
+                        error_tokens = (
+                            "503",
+                            "UNAVAILABLE",
+                            "404",
+                            "NOT_FOUND",
+                            "429",
+                            "RESOURCE_EXHAUSTED",
+                            "QUOTA",
+                        )
+                        if any(tok in exc_str for tok in error_tokens):
+                            quota_tokens = ("429", "RESOURCE_EXHAUSTED", "QUOTA")
+                            if any(qtok in exc_str for qtok in quota_tokens):
+                                cooldown_sec = parse_retry_delay_seconds(exc_str)
+                                self._model_cooldown_until[candidate_model] = time.monotonic() + cooldown_sec
+                            if not is_last:
+                                logger.warning(
+                                    f"Gemini model '{candidate_model}' encountered error ({initial_exc}). Retrying with next candidate model."
+                                )
+                                continue
+                            else:
+                                raise initial_exc
+                        else:
+                            raise initial_exc
 
             usage = getattr(response, "usage_metadata", None)
             val_in = getattr(usage, "prompt_token_count", 0) if usage is not None else 0
@@ -802,6 +894,7 @@ def get_semantic_evaluator(
     provider: Optional[str] = None,
     fallback_to_mock: bool = True,
     max_input_chars: Optional[int] = None,
+    failover_models: Optional[list[str]] = None,
     **kwargs: Any,
 ) -> Union[GeminiSemanticEvaluator, OpenAISemanticEvaluator, MockSemanticEvaluator]:
     """
@@ -836,6 +929,7 @@ def get_semantic_evaluator(
                 model_name=model or kwargs.pop("model_name", None),
                 fallback_to_mock=fallback_to_mock,
                 max_input_chars=max_input_chars,
+                failover_models=failover_models,
                 **kwargs,
             )
             logger.info(f"Initialized GeminiSemanticEvaluator using model '{evaluator.model_name}'.")

@@ -212,6 +212,7 @@ def create_deployment_rule_payload(
     deployer: str,
     selectors: List[Dict[str, str]],
     bytecode_length: int,
+    require_high_risk_for_llm: bool = False,
 ) -> ConditionRulePayload:
     """
     Constructs a validated ConditionRulePayload for evaluating a newly discovered smart contract.
@@ -219,6 +220,7 @@ def create_deployment_rule_payload(
     checksummed_address = Web3.to_checksum_address(contract_address)
     signatures = [s["signature"] for s in selectors]
     high_risk_found = [s["signature"] for s in selectors if is_high_risk_signature(s["signature"])]
+    semantic_enabled = bool(high_risk_found) if require_high_risk_for_llm else True
 
     # Determine priority selector for deterministic calldata analysis
     matched_selector = "0x"
@@ -260,7 +262,7 @@ def create_deployment_rule_payload(
             check_native_balance=False,
         ),
         semantic=SemanticCondition(
-            enabled=True,
+            enabled=semantic_enabled,
             policy_prompt=prompt,
             risk_threshold=7.0,
         ),
@@ -415,6 +417,7 @@ async def audit_discovered_contracts(
     contracts: List[Dict[str, Any]],
     engine: ConditionAgentEngine,
     rpc_url: Optional[str] = None,
+    require_high_risk_for_llm: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Executes deterministic bytecode inspection and semantic risk audits on discovered contracts.
@@ -447,6 +450,7 @@ async def audit_discovered_contracts(
             deployer=deployer,
             selectors=selectors,
             bytecode_length=len(bytecode_bytes),
+            require_high_risk_for_llm=require_high_risk_for_llm,
         )
 
         # 4. Execute two-stage ConditionAgentEngine audit
@@ -459,12 +463,6 @@ async def audit_discovered_contracts(
         sem = response.semantic_Evaluation
         decision = sem.recommended_action if sem else ("APPROVE" if response.deterministic_check.passed else "REJECT")
         risk_score = sem.risk_score if sem else (0.0 if response.deterministic_check.passed else 10.0)
-
-        # Ensure persistence in AgentStorage
-        try:
-            await engine.storage.record_evaluation(payload, response, source="block_scanner")
-        except Exception as exc:
-            logger.warning(f"Direct storage recording failed: {exc}")
 
         results.append({
             "block_number": block_num,
