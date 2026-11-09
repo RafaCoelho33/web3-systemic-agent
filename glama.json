@@ -1,0 +1,15 @@
+{
+  "$schema": "https://glama.ai/mcp/schemas/server.json",
+  "name": "web3-systemic-agent",
+  "description": "Autonomous Web3 Security and Governance Auditor MCP Server. Provides 3 free Stage 1 on-chain analysis tools (contract selectors, honeypot detection, Snapshot DAO scanning) and 1 paid Stage 2 Deep Semantic LLM Audit tool via x402 USDC micropayments.",
+  "maintainers": [
+    "RafaCoelho33"
+  ],
+  "homepage": "https://web3-systemic-agent.onrender.com",
+  "repository": "https://github.com/RafaCoelho33/web3-systemic-agent",
+  "capabilities": {
+    "tools": true,
+    "resources": false,
+    "prompts": false
+  }
+}

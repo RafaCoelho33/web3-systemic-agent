@@ -1,0 +1,17 @@
+# Smithery MCP Server Manifest
+# https://smithery.ai/docs/config#smitheryyaml
+
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    properties:
+      web3AgentUrl:
+        type: string
+        description: "Public URL of the Web3 Condition-Action Trigger Agent service"
+        default: "https://web3-systemic-agent.onrender.com"
+      x402BuyerPrivateKey:
+        type: string
+        description: "Optional EVM private key with USDC on Base to automate paid Stage 2 deep semantic audits"
+  commandFunction:
+    python: "python -m src.mcp_server"

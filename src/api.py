@@ -86,6 +86,12 @@ try:
         GovernanceScanRequest,
         get_curated_dao_proposals,
     )
+    from src.mcp_server import (
+        Web3SystemicMCPServer,
+        MCP_PROTOCOL_VERSION,
+        MCP_SERVER_NAME,
+        MCP_SERVER_VERSION,
+    )
 except ImportError:
     from schemas import (
         ConditionRulePayload,
@@ -120,6 +126,12 @@ except ImportError:
         GovernanceAuditReport,
         GovernanceScanRequest,
         get_curated_dao_proposals,
+    )
+    from mcp_server import (
+        Web3SystemicMCPServer,
+        MCP_PROTOCOL_VERSION,
+        MCP_SERVER_NAME,
+        MCP_SERVER_VERSION,
     )
 
 if not hasattr(X402Config, "price_atomic"):
@@ -440,6 +452,7 @@ def create_app(
                 "/rules/evaluate-batch",
                 "/rules/validate",
                 "/rules/enqueue",
+                "/mcp",
             }
             path = request.url.path
             if path in allowed_paths or path.startswith("/jobs/"):
@@ -468,6 +481,7 @@ def create_app(
     app.state.facilitator = active_facilitator
     app.state.scanner_active = False
     app.state.scanner_task = None
+    app.state.mcp_server = Web3SystemicMCPServer(engine=active_engine)
 
     # Intercept /evaluate requests for Coinbase CDP Crawler & x402 Bazaar compliance
     @app.middleware("http")
@@ -591,6 +605,7 @@ def create_app(
                 "evaluate": "/evaluate",
                 "evaluate_batch": "/rules/evaluate-batch",
                 "enqueue_job": "/rules/enqueue",
+                "mcp": "/mcp",
             }
         else:
             endpoints = {
@@ -604,6 +619,7 @@ def create_app(
                 "metrics_summary": "/metrics/summary",
                 "payments_ledger": "/payments",
                 "error_logs": "/logs/errors",
+                "mcp": "/mcp",
             }
         return {
             "service": "Web3 Condition-Action Trigger Agent",
@@ -622,6 +638,67 @@ def create_app(
         Silent favicon handler returning 204 No Content to avoid browser 404 noise.
         """
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @app.get(
+        "/mcp",
+        tags=["MCP Server"],
+        summary="MCP Discovery and Tools Manifest",
+    )
+    async def get_mcp_discovery():
+        """
+        Model Context Protocol (MCP) streamable-http discovery endpoint.
+        Returns server metadata, protocol version, and the full tools manifest.
+        """
+        mcp: Optional[Web3SystemicMCPServer] = getattr(app.state, "mcp_server", None)
+        tools = mcp.get_tools_manifest() if mcp else []
+        return {
+            "name": MCP_SERVER_NAME,
+            "version": MCP_SERVER_VERSION,
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "transport": "streamable-http",
+            "tools": tools,
+        }
+
+    @app.post(
+        "/mcp",
+        tags=["MCP Server"],
+        summary="MCP JSON-RPC Execution Endpoint",
+    )
+    async def post_mcp_jsonrpc(request: Request):
+        """
+        Model Context Protocol (MCP) JSON-RPC 2.0 execution endpoint.
+        Accepts standard MCP JSON-RPC requests (e.g. tools/list, tools/call, initialize, ping).
+        """
+        mcp: Optional[Web3SystemicMCPServer] = getattr(app.state, "mcp_server", None)
+        if mcp is None:
+            mcp = Web3SystemicMCPServer(engine=getattr(app.state, "engine", None))
+            app.state.mcp_server = mcp
+
+        try:
+            body = await request.json()
+        except Exception as exc:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32700, "message": f"Parse error: {exc}"},
+                },
+            )
+
+        if isinstance(body, list):
+            responses = []
+            for item in body:
+                resp = await mcp.handle_jsonrpc(item)
+                if resp is not None:
+                    responses.append(resp)
+            return JSONResponse(status_code=status.HTTP_200_OK, content=responses)
+
+        rpc_resp = await mcp.handle_jsonrpc(body)
+        if rpc_resp is None:
+            return Response(status_code=status.HTTP_202_ACCEPTED)
+
+        return JSONResponse(status_code=status.HTTP_200_OK, content=rpc_resp)
 
     @app.get(
         "/health",
