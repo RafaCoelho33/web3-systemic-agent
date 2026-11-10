@@ -1,0 +1,27 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.RafaCoelho33/web3-systemic-agent",
+  "title": "Web3 Systemic Agent",
+  "description": "Web3 security & DAO auditor: free bytecode/honeypot/Snapshot tools + x402 Gemini LLM deep audit.",
+  "version": "1.0.1",
+  "websiteUrl": "https://web3-systemic-agent.onrender.com",
+  "icons": [
+    {
+      "src": "https://web3-systemic-agent.onrender.com/icon.svg",
+      "mimeType": "image/svg+xml",
+      "sizes": [
+        "any"
+      ]
+    }
+  ],
+  "repository": {
+    "url": "https://github.com/RafaCoelho33/web3-systemic-agent",
+    "source": "github"
+  },
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://web3-systemic-agent.onrender.com/mcp"
+    }
+  ]
+}

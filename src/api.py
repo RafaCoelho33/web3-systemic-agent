@@ -373,6 +373,24 @@ Canonical: https://web3-systemic-agent.onrender.com/.well-known/security.txt
 Policy: https://github.com/RafaCoelho33/web3_systemic-agent/blob/main/README.md
 """
 
+ICON_SVG_CONTENT = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="shieldGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0052FF" />
+      <stop offset="100%" stop-color="#1652F0" />
+    </linearGradient>
+    <linearGradient id="glowGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00D2FF" />
+      <stop offset="100%" stop-color="#0052FF" />
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="#0A0B0D"/>
+  <path d="M64 16 L104 32 C104 76 74 104 64 112 C54 104 24 76 24 32 Z" fill="url(#shieldGrad)" stroke="#1E2025" stroke-width="2"/>
+  <path d="M64 24 L96 38 C96 72 72 96 64 103 C56 96 32 72 32 38 Z" fill="none" stroke="url(#glowGrad)" stroke-width="2.5" opacity="0.8"/>
+  <circle cx="64" cy="64" r="16" fill="#00D2FF" opacity="0.9"/>
+  <path d="M58 64 L62 68 L70 58" fill="none" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>"""
+
 LLMS_TXT_CONTENT = """# Web3 Systemic Agent (io.github.RafaCoelho33/web3-systemic-agent)
 > Autonomous Web3 Security & Governance Auditor with Two-Stage Hybrid LLM Pipeline & x402 Bazaar Micropayments.
 
@@ -667,6 +685,7 @@ def create_app(
             allowed_paths = {
                 "/",
                 "/favicon.ico",
+                "/icon.svg",
                 "/health",
                 "/evaluate",
                 "/rules/evaluate-batch",
@@ -963,6 +982,11 @@ def create_app(
         """Returns structured Markdown guide teaching LLMs how to use the Web3 Systemic Agent."""
         return Response(content=LLMS_TXT_CONTENT, media_type="text/plain; charset=utf-8")
 
+    @app.get("/icon.svg", include_in_schema=False)
+    async def get_icon_svg():
+        """Returns static server SVG icon."""
+        return Response(content=ICON_SVG_CONTENT, media_type="image/svg+xml")
+
     @app.get("/.well-known/mcp/server-card.json", include_in_schema=False)
     @app.get("/.well-known/mcp.json", include_in_schema=False)
     async def get_mcp_server_card():
@@ -984,6 +1008,14 @@ def create_app(
                 "version": "1.0.0",
             },
             "protocolVersion": MCP_PROTOCOL_VERSION,
+            "websiteUrl": public_url,
+            "icons": [
+                {
+                    "src": f"{public_url}/icon.svg",
+                    "mimeType": "image/svg+xml",
+                    "sizes": ["any"],
+                }
+            ],
             "transport": "streamable-http",
             "remotes": [
                 {

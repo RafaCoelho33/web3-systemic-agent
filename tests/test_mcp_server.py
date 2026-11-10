@@ -138,6 +138,40 @@ class TestMCPProtocolHandshakeAndDiscovery:
             assert isinstance(schema["properties"], dict)
 
     @pytest.mark.asyncio
+    async def test_mcp_tools_manifest_annotations_and_hints(self, server: Web3SystemicMCPServer):
+        """
+        Validates that every tool returned by get_tools_manifest() and tools/list
+        includes an 'annotations' dict containing:
+        - readOnlyHint: True
+        - destructiveHint: False
+        - openWorldHint: True
+        - title: non-empty string
+        """
+        manifest = server.get_tools_manifest()
+        assert len(manifest) == 4
+
+        req = {
+            "jsonrpc": "2.0",
+            "id": "tools-ann-1",
+            "method": "tools/list",
+        }
+        res = await server.handle_jsonrpc(req)
+        assert res is not None
+        tools_from_rpc = res["result"]["tools"]
+
+        for tool_list in (manifest, tools_from_rpc):
+            for t in tool_list:
+                assert "annotations" in t, f"Tool {t.get('name')} missing 'annotations'"
+                ann = t["annotations"]
+                assert isinstance(ann, dict), f"Tool {t.get('name')} 'annotations' must be a dict"
+                assert ann.get("readOnlyHint") is True, f"Tool {t.get('name')} readOnlyHint must be True"
+                assert ann.get("destructiveHint") is False, f"Tool {t.get('name')} destructiveHint must be False"
+                assert ann.get("openWorldHint") is True, f"Tool {t.get('name')} openWorldHint must be True"
+                assert "title" in ann and isinstance(ann["title"], str) and len(ann["title"]) > 0, (
+                    f"Tool {t.get('name')} title must be a non-empty string"
+                )
+
+    @pytest.mark.asyncio
     async def test_mcp_resources_and_prompts_list(self, server: Web3SystemicMCPServer):
         """Validates 'resources/list' and 'prompts/list' return valid structures."""
         res_resources = await server.handle_jsonrpc({"jsonrpc": "2.0", "id": 10, "method": "resources/list"})
@@ -589,6 +623,36 @@ class TestMCPManifestsAndDryRunCLI:
         assert "description" in data
         assert data.get("capabilities", {}).get("tools") is True
 
+    def test_server_json_manifest_exists_and_valid(self):
+        """
+        Verifies that server.json in the repo root exists, is valid JSON, has:
+        - name == 'io.github.RafaCoelho33/web3-systemic-agent'
+        - len(description) <= 100
+        - websiteUrl == 'https://web3-systemic-agent.onrender.com'
+        - non-empty 'icons' list with src == 'https://web3-systemic-agent.onrender.com/icon.svg'
+        """
+        server_json_path = Path(ROOT_DIR) / "server.json"
+        assert server_json_path.exists(), "server.json must exist in repo root"
+
+        with open(server_json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        assert isinstance(data, dict)
+        assert data.get("name") == "io.github.RafaCoelho33/web3-systemic-agent"
+        assert "description" in data
+        assert isinstance(data["description"], str)
+        assert len(data["description"]) <= 100, (
+            f"server.json description length must be <= 100 characters (got {len(data['description'])})"
+        )
+        assert data.get("websiteUrl") == "https://web3-systemic-agent.onrender.com"
+
+        icons = data.get("icons")
+        assert isinstance(icons, list) and len(icons) > 0, "server.json must have non-empty 'icons' list"
+        icon_srcs = [i.get("src") for i in icons if isinstance(i, dict)]
+        assert "https://web3-systemic-agent.onrender.com/icon.svg" in icon_srcs, (
+            "server.json icons must contain 'https://web3-systemic-agent.onrender.com/icon.svg'"
+        )
+
     def test_readme_mentions_mcp_server_and_tools(self):
         """Verifies README.md documents the MCP server, transport modes, and tool signatures."""
         readme_path = Path(ROOT_DIR) / "README.md"
@@ -738,6 +802,16 @@ class TestAgentDiscoveryTeachingAndSecurityHardening:
             text = res.text
             assert "Contact:" in text
             assert "Expires:" in text
+
+    def test_icon_svg_endpoint_public_and_valid(self, test_client: TestClient):
+        """
+        Validates that GET /icon.svg works in public_evaluate_only=True lockdown mode,
+        returns 200 OK with 'image/svg+xml' content-type, and contains '<svg'.
+        """
+        response = test_client.get("/icon.svg")
+        assert response.status_code == 200, f"/icon.svg did not return 200 OK (got {response.status_code})"
+        assert "image/svg+xml" in response.headers.get("content-type", "").lower()
+        assert "<svg" in response.text.lower()
 
     def test_strict_lockdown_blocks_unauthorized_and_crawler_noise_paths(self, test_client: TestClient):
         """

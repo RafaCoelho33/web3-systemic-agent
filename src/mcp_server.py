@@ -165,6 +165,13 @@ class Web3SystemicMCPServer:
                     "Discovers 4-byte function selectors and flags high-risk administrative capabilities "
                     "(ownership transfer, proxy upgrade, unconstrained minting, selfdestruct)."
                 ),
+                "annotations": {
+                    "title": "Scan Smart Contract Bytecode & Selectors",
+                    "readOnlyHint": True,
+                    "destructiveHint": False,
+                    "idempotentHint": True,
+                    "openWorldHint": True,
+                },
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -192,6 +199,13 @@ class Web3SystemicMCPServer:
                     "blacklist manipulation (isBlacklisted, setBlacklist), arbitrary transfer taxes / 100% sell fee traps, "
                     "trading freeze backdoors, and selfdestruct opcodes."
                 ),
+                "annotations": {
+                    "title": "Check Token Honeypot & Tax Traps",
+                    "readOnlyHint": True,
+                    "destructiveHint": False,
+                    "idempotentHint": True,
+                    "openWorldHint": True,
+                },
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -218,6 +232,13 @@ class Web3SystemicMCPServer:
                     "Stage 1 Free scanner for recent Snapshot DAO governance proposals (Arbitrum, Aave, ENS). "
                     "Extracts on-chain target addresses and calldata execution payloads to detect governance takeover attempts and discrepancies."
                 ),
+                "annotations": {
+                    "title": "Scan Snapshot DAO Governance Proposals",
+                    "readOnlyHint": True,
+                    "destructiveHint": False,
+                    "idempotentHint": True,
+                    "openWorldHint": True,
+                },
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -247,6 +268,13 @@ class Web3SystemicMCPServer:
                     "over natural language proposal claims vs bytecode and calldata reality. "
                     "Requires $0.05 USDC x402 micropayment on Base Mainnet."
                 ),
+                "annotations": {
+                    "title": "Deep Semantic LLM Governance & Contract Audit (x402)",
+                    "readOnlyHint": True,
+                    "destructiveHint": False,
+                    "idempotentHint": False,
+                    "openWorldHint": True,
+                },
                 "inputSchema": {
                     "type": "object",
                     "properties": {
