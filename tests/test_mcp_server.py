@@ -622,3 +622,157 @@ class TestMCPManifestsAndDryRunCLI:
         assert proc.returncode == 0, f"CLI dry-run failed:\nstdout={proc.stdout}\nstderr={proc.stderr}"
         assert "Registered 4 MCP tools" in proc.stdout
         assert "All MCP self-tests PASSED successfully" in proc.stdout
+
+
+# =========================================================================
+# 6. Crawler Discovery, Agent-Teaching & Security Hardening Tests
+# =========================================================================
+
+class TestAgentDiscoveryTeachingAndSecurityHardening:
+    """
+    Validates crawler discovery manifests (robots.txt), agent-teaching files (llms.txt, llms-full.txt),
+    standard well-known agent and MCP cards, and strict lockdown blocking unauthorized / crawler noise paths.
+    """
+
+    @pytest.fixture
+    def test_client(self, tmp_path: Path) -> TestClient:
+        db_file = str(tmp_path / "api_discovery_test.db")
+        storage = AgentStorage(db_path=db_file)
+        evaluator = MockSemanticEvaluator()
+        engine = ConditionAgentEngine(semantic_evaluator=evaluator, storage=storage)
+
+        app = create_app(
+            engine=engine,
+            public_evaluate_only=True,
+            enable_background_scanner=False,
+        )
+        return TestClient(app)
+
+    def test_robots_txt_public_and_valid(self, test_client: TestClient):
+        """
+        Validates that GET /robots.txt returns 200 OK, text/plain, and correctly
+        specifies crawl allowances for agent endpoints (/mcp, /llms.txt) while
+        disallowing sensitive/internal endpoints (/metrics/, /logs/).
+        """
+        response = test_client.get("/robots.txt")
+        assert response.status_code == 200
+        assert "text/plain" in response.headers.get("content-type", "").lower()
+
+        text = response.text
+        assert "User-agent: *" in text
+        assert "Allow: /mcp" in text
+        assert "Allow: /llms.txt" in text
+        assert "Disallow: /metrics/" in text
+        assert "Disallow: /logs/" in text
+
+    def test_llms_txt_and_llms_full_txt_teach_agent_usage(self, test_client: TestClient):
+        """
+        Validates that GET /llms.txt and GET /llms-full.txt return 200 OK, text/plain,
+        and thoroughly teach external LLM agents how to invoke all 4 MCP tools,
+        the FastAPI endpoints (/mcp, /evaluate, /rules/validate), and x402 payment details.
+        """
+        for path in ("/llms.txt", "/llms-full.txt"):
+            response = test_client.get(path)
+            assert response.status_code == 200, f"{path} did not return 200 OK"
+            assert "text/plain" in response.headers.get("content-type", "").lower()
+
+            content = response.text
+            # All 4 MCP tools must be documented
+            assert "scan_contract_selectors" in content, f"{path} missing scan_contract_selectors"
+            assert "check_token_honeypot" in content, f"{path} missing check_token_honeypot"
+            assert "scan_dao_proposals" in content, f"{path} missing scan_dao_proposals"
+            assert "deep_semantic_audit" in content, f"{path} missing deep_semantic_audit"
+
+            # Key endpoints and protocols
+            assert "/mcp" in content, f"{path} missing /mcp"
+            assert "/evaluate" in content, f"{path} missing /evaluate"
+            assert "/rules/validate" in content, f"{path} missing /rules/validate"
+            assert "x402" in content.lower(), f"{path} missing x402 documentation"
+
+    def test_well_known_mcp_server_card_and_agent_card(self, test_client: TestClient):
+        """
+        Validates discovery server-cards and agent-cards under /.well-known:
+        - GET /.well-known/mcp/server-card.json and /.well-known/mcp.json return 200 OK JSON
+          with serverInfo.name == 'io.github.RafaCoelho33/web3-systemic-agent',
+          protocolVersion == '2024-11-05', and the 4 tools.
+        - GET /.well-known/agent.json returns 200 OK JSON with capabilities.mcp is True,
+          capabilities.x402 is True, payment, endpoints, and skills.
+        """
+        for card_path in ("/.well-known/mcp/server-card.json", "/.well-known/mcp.json"):
+            res = test_client.get(card_path)
+            assert res.status_code == 200, f"{card_path} did not return 200 OK"
+            data = res.json()
+            assert data.get("serverInfo", {}).get("name") == "io.github.RafaCoelho33/web3-systemic-agent"
+            assert data.get("protocolVersion") == "2024-11-05"
+            assert "tools" in data
+            assert len(data["tools"]) == 4
+
+            tool_names = {t["name"] for t in data["tools"]}
+            assert tool_names == {
+                "scan_contract_selectors",
+                "check_token_honeypot",
+                "scan_dao_proposals",
+                "deep_semantic_audit",
+            }
+
+        # Agent card
+        agent_res = test_client.get("/.well-known/agent.json")
+        assert agent_res.status_code == 200, "/.well-known/agent.json did not return 200 OK"
+        agent_data = agent_res.json()
+        assert agent_data.get("capabilities", {}).get("mcp") is True
+        assert agent_data.get("capabilities", {}).get("x402") is True
+        assert "payment" in agent_data
+        assert "endpoints" in agent_data
+        assert "skills" in agent_data
+
+    def test_security_txt_endpoints(self, test_client: TestClient):
+        """
+        Validates security.txt standard endpoints:
+        - GET /.well-known/security.txt and GET /security.txt return 200 OK, text/plain,
+          containing 'Contact:' and 'Expires:'.
+        """
+        for sec_path in ("/.well-known/security.txt", "/security.txt"):
+            res = test_client.get(sec_path)
+            assert res.status_code == 200, f"{sec_path} did not return 200 OK"
+            assert "text/plain" in res.headers.get("content-type", "").lower()
+            text = res.text
+            assert "Contact:" in text
+            assert "Expires:" in text
+
+    def test_strict_lockdown_blocks_unauthorized_and_crawler_noise_paths(self, test_client: TestClient):
+        """
+        Verifies that in public_evaluate_only=True mode, probing unauthorized paths and
+        common web crawler / vulnerability scanning paths returns 403 Forbidden, and
+        the responses strictly enforce security headers:
+        - x-content-type-options: nosniff
+        - x-frame-options: DENY
+        """
+        forbidden_paths = [
+            "/contact",
+            "/about",
+            "/privacy",
+            "/terms",
+            "/legal",
+            "/imprint",
+            "/impressum",
+            "/team",
+            "/.env",
+            "/.git/config",
+            "/metrics/summary",
+            "/logs/errors",
+            "/payments",
+        ]
+
+        for path in forbidden_paths:
+            res = test_client.get(path)
+            assert res.status_code == 403, f"Path {path} was not blocked by lockdown (status: {res.status_code})"
+
+            # Verify mandatory security hardening headers
+            headers_lower = {k.lower(): v for k, v in res.headers.items()}
+            assert headers_lower.get("x-content-type-options") == "nosniff", (
+                f"Path {path} missing 'X-Content-Type-Options: nosniff' header"
+            )
+            assert headers_lower.get("x-frame-options") == "DENY", (
+                f"Path {path} missing 'X-Frame-Options: DENY' header"
+            )
+

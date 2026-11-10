@@ -296,6 +296,226 @@ async def _background_scanner_worker(app_instance: FastAPI):
         app_instance.state.scanner_active = False
 
 
+# -------------------------------------------------------------------------
+# Static Discovery & Agent-Teaching Content
+# -------------------------------------------------------------------------
+
+ROBOTS_TXT_CONTENT = """User-agent: *
+Allow: /
+Allow: /mcp
+Allow: /evaluate
+Allow: /rules/validate
+Allow: /llms.txt
+Allow: /llms-full.txt
+Allow: /.well-known/
+Disallow: /metrics/
+Disallow: /logs/
+Disallow: /payments
+Disallow: /jobs/
+
+User-agent: GPTBot
+Allow: /
+Allow: /mcp
+Allow: /evaluate
+Allow: /rules/validate
+Allow: /llms.txt
+Allow: /llms-full.txt
+Allow: /.well-known/
+Disallow: /metrics/
+Disallow: /logs/
+Disallow: /payments
+Disallow: /jobs/
+
+User-agent: ClaudeBot
+Allow: /
+Allow: /mcp
+Allow: /evaluate
+Allow: /rules/validate
+Allow: /llms.txt
+Allow: /llms-full.txt
+Allow: /.well-known/
+Disallow: /metrics/
+Disallow: /logs/
+Disallow: /payments
+Disallow: /jobs/
+
+User-agent: PerplexityBot
+Allow: /
+Allow: /mcp
+Allow: /evaluate
+Allow: /rules/validate
+Allow: /llms.txt
+Allow: /llms-full.txt
+Allow: /.well-known/
+Disallow: /metrics/
+Disallow: /logs/
+Disallow: /payments
+Disallow: /jobs/
+
+User-agent: Google-Extended
+Allow: /
+Allow: /mcp
+Allow: /evaluate
+Allow: /rules/validate
+Allow: /llms.txt
+Allow: /llms-full.txt
+Allow: /.well-known/
+Disallow: /metrics/
+Disallow: /logs/
+Disallow: /payments
+Disallow: /jobs/
+"""
+
+SECURITY_TXT_CONTENT = """Contact: https://github.com/RafaCoelho33/web3_systemic-agent/issues
+Expires: 2027-12-31T23:59:59.000Z
+Preferred-Languages: en, pt
+Canonical: https://web3-systemic-agent.onrender.com/.well-known/security.txt
+Policy: https://github.com/RafaCoelho33/web3_systemic-agent/blob/main/README.md
+"""
+
+LLMS_TXT_CONTENT = """# Web3 Systemic Agent (io.github.RafaCoelho33/web3-systemic-agent)
+> Autonomous Web3 Security & Governance Auditor with Two-Stage Hybrid LLM Pipeline & x402 Bazaar Micropayments.
+
+## System Overview
+- **System Identifier:** `io.github.RafaCoelho33/web3-systemic-agent`
+- **Name:** Web3 Systemic Agent
+- **Version:** `1.0.0`
+- **Public API URL:** `https://web3-systemic-agent.onrender.com`
+- **Supported Chains:** Base Mainnet (`eip155:8453`), Base Sepolia (`eip155:84532`), Arbitrum One (`eip155:42161`)
+
+## Two-Stage Hybrid Architecture
+1. **Stage 1: Deterministic On-Chain Gatekeeping (Zero LLM Token Cost / Free)**
+   - High-throughput EVM bytecode and calldata analysis using `ChainInspector` with local FIFO caching.
+   - Extracts 4-byte function selectors, inspects target contract bytecode existence, verifies native balances, and evaluates DEX honeypot signatures.
+   - Short-circuits non-matching or benign conditions with `llm_invoked=False` ($0.00 LLM token cost).
+2. **Stage 2: Deep Semantic LLM Governance & Security Audit ($0.05 USDC via x402)**
+   - Triggered only when Stage 1 deterministic conditions pass or high-risk administrative capabilities are detected.
+   - Leverages Google Gemini (`gemini-3.5-flash-lite` with automatic cooldown failover to `gemini-3.1-flash-lite`, `gemini-2.5-flash-lite`, and `gemini-2.0-flash`).
+   - Evaluates natural language claims against actual on-chain bytecode, native balance, and execution calldata.
+   - Enforces deterministic policy escalation (`APPROVE`, `MANUAL_REVIEW`, `REJECT`) via `enforce_decision_policy`.
+
+## Model Context Protocol (MCP) Streamable-HTTP (`POST /mcp`)
+Connect using MCP specification `2024-11-05` via HTTP POST:
+- **Endpoint:** `POST https://web3-systemic-agent.onrender.com/mcp`
+- **Headers:** `Content-Type: application/json`
+
+### JSON-RPC 2.0 Examples
+
+#### 1. Initialize Request
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "initialize",
+  "params": {
+    "protocolVersion": "2024-11-05",
+    "capabilities": {},
+    "clientInfo": {"name": "autonomous-client", "version": "1.0.0"}
+  }
+}
+```
+
+#### 2. Tools List Request
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/list"
+}
+```
+
+#### 3. Tools Call Request (scan_contract_selectors)
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tools/call",
+  "params": {
+    "name": "scan_contract_selectors",
+    "arguments": {
+      "target_address": "0x4200000000000000000000000000000000000006",
+      "chain_id": 8453
+    }
+  }
+}
+```
+
+## Available MCP Tools
+
+### 1. `scan_contract_selectors` (Stage 1 Free)
+- **Description:** Deterministic inspection of smart contract bytecode to discover 4-byte EVM selectors and detect high-risk administrative backdoors (`transferOwnership`, `upgradeTo`, `mint`, `selfdestruct`).
+- **Arguments:**
+  - `target_address` (string, required): Hex EVM address of smart contract.
+  - `chain_id` (integer, default 8453): EVM Chain ID (8453 for Base Mainnet, 84532 for Base Sepolia, 42161 for Arbitrum One).
+  - `bytecode_override` (string, optional): Raw contract runtime hex bytecode for offline analysis.
+
+### 2. `check_token_honeypot` (Stage 1 Free)
+- **Description:** Static bytecode analysis for DEX honeypots, rugpull traps, and malicious token contracts: blacklist manipulation (`isBlacklisted`, `setBlacklist`), arbitrary transfer taxes (`setTax`, `setFee`), pause backdoors (`pause`, `setTrading`), and `selfdestruct` (opcode `0xff`).
+- **Arguments:**
+  - `token_address` (string, required): Hex EVM address of token contract.
+  - `chain_id` (integer, default 8453): EVM Chain ID.
+  - `bytecode_override` (string, optional): Raw token runtime hex bytecode for offline analysis.
+
+### 3. `scan_dao_proposals` (Stage 1 Free)
+- **Description:** Ingests recent Snapshot DAO governance proposals (Arbitrum, Aave, ENS). Extracts on-chain target addresses, Wei transfers, and calldata execution payloads to flag governance discrepancies.
+- **Arguments:**
+  - `space_id` (string, default "arbitrumfoundation.eth"): Snapshot space ENS domain.
+  - `limit` (integer, default 3): Number of proposals to fetch.
+  - `use_curated_offline` (boolean, default false): If true, returns verified offline curated proposals.
+
+### 4. `deep_semantic_audit` (Stage 2 Paid - $0.05 USDC via x402)
+- **Description:** Two-stage security audit crossing natural language proposal text with on-chain bytecode and calldata. Returns risk scores (0.0 to 10.0), flagged issues, and deterministic policy action (`APPROVE`, `MANUAL_REVIEW`, `REJECT`).
+- **Arguments:**
+  - `target_address` (string, required): Smart contract address under evaluation.
+  - `proposal_description` (string, required): Claim or governance proposal intent.
+  - `policy_prompt` (string, optional): Custom policy prompt.
+  - `calldata` (string, default "0x"): Hex calldata being executed.
+  - `chain_id` (integer, default 8453): EVM Chain ID.
+  - `risk_threshold` (number, default 7.0): Risk threshold.
+  - `x402_payment_header` (string, optional): Base64 EIP-3009 transfer authorization.
+- **Payment Requirement:** If called without `x402_payment_header` or configured buyer key, returns HTTP 402 with recipient address `0x2b7F1fd931f7f28f89e0f688Dd5Bb7a620c24b63` on Base Mainnet (`eip155:8453`).
+
+## REST API Integration
+
+### Static Rule Validation (Free)
+- **Endpoint:** `POST https://web3-systemic-agent.onrender.com/rules/validate`
+- Validates payload structure and parameters before submission.
+
+### Deep Evaluation Execution ($0.05 USDC via x402)
+- **Endpoint:** `POST https://web3-systemic-agent.onrender.com/evaluate`
+- **Headers:** `X-PAYMENT: <base64_eip3009_auth>`
+
+#### Example Request Payload:
+```json
+{
+  "rule_id": "rule-audit-001",
+  "chain_id": 8453,
+  "deterministic": {
+    "target_address": "0x4200000000000000000000000000000000000006",
+    "min_value_wei": 0,
+    "required_function_selectors": null,
+    "check_native_balance": false
+  },
+  "semantic": {
+    "enabled": true,
+    "policy_prompt": "Audit contract for unauthorized ownership transfer or backdoor drainage.",
+    "risk_threshold": 7.0
+  },
+  "context_metadata": {
+    "proposal_description": "Routine parameter update without audit",
+    "calldata": "0xf2fde38b000000000000000000000000deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+  }
+}
+```
+
+## Security & Transparency
+- **Security Policy:** `/.well-known/security.txt`
+- **MCP Server Card:** `/.well-known/mcp/server-card.json`
+- **Agent Card:** `/.well-known/agent.json`
+- **Contact:** https://github.com/RafaCoelho33/web3_systemic-agent/issues
+"""
+
+
 def create_app(
     engine: Optional[ConditionAgentEngine] = None,
     storage: Optional[AgentStorage] = None,
@@ -453,6 +673,14 @@ def create_app(
                 "/rules/validate",
                 "/rules/enqueue",
                 "/mcp",
+                "/robots.txt",
+                "/llms.txt",
+                "/llms-full.txt",
+                "/.well-known/mcp/server-card.json",
+                "/.well-known/mcp.json",
+                "/.well-known/agent.json",
+                "/.well-known/security.txt",
+                "/security.txt",
             }
             path = request.url.path
             if path in allowed_paths or path.startswith("/jobs/"):
@@ -463,6 +691,11 @@ def create_app(
                 content={
                     "error": "Forbidden",
                     "message": "Public access is restricted to evaluation endpoints only.",
+                },
+                headers={
+                    "X-Content-Type-Options": "nosniff",
+                    "X-Frame-Options": "DENY",
+                    "Referrer-Policy": "no-referrer",
                 },
             )
 
@@ -502,6 +735,15 @@ def create_app(
                         x402_cfg.price_per_eval_usdc,
                     )
         return await call_next(request)
+
+    # Defensive HTTP Security Headers (applied to all responses)
+    @app.middleware("http")
+    async def security_headers_middleware(request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
 
     # ---------------------------------------------------------------------
     # Standardized Exception Handlers
@@ -606,6 +848,9 @@ def create_app(
                 "evaluate_batch": "/rules/evaluate-batch",
                 "enqueue_job": "/rules/enqueue",
                 "mcp": "/mcp",
+                "llms_txt": "/llms.txt",
+                "mcp_server_card": "/.well-known/mcp/server-card.json",
+                "agent_card": "/.well-known/agent.json",
             }
         else:
             endpoints = {
@@ -620,6 +865,9 @@ def create_app(
                 "payments_ledger": "/payments",
                 "error_logs": "/logs/errors",
                 "mcp": "/mcp",
+                "llms_txt": "/llms.txt",
+                "mcp_server_card": "/.well-known/mcp/server-card.json",
+                "agent_card": "/.well-known/agent.json",
             }
         return {
             "service": "Web3 Condition-Action Trigger Agent",
@@ -699,6 +947,111 @@ def create_app(
             return Response(status_code=status.HTTP_202_ACCEPTED)
 
         return JSONResponse(status_code=status.HTTP_200_OK, content=rpc_resp)
+
+    # ---------------------------------------------------------------------
+    # Crawler Discovery, Agent-Teaching & Security Endpoints
+    # ---------------------------------------------------------------------
+
+    @app.get("/robots.txt", include_in_schema=False)
+    async def get_robots_txt():
+        """Returns robots.txt rules for search engine and AI crawlers."""
+        return Response(content=ROBOTS_TXT_CONTENT, media_type="text/plain; charset=utf-8")
+
+    @app.get("/llms.txt", include_in_schema=False)
+    @app.get("/llms-full.txt", include_in_schema=False)
+    async def get_llms_txt():
+        """Returns structured Markdown guide teaching LLMs how to use the Web3 Systemic Agent."""
+        return Response(content=LLMS_TXT_CONTENT, media_type="text/plain; charset=utf-8")
+
+    @app.get("/.well-known/mcp/server-card.json", include_in_schema=False)
+    @app.get("/.well-known/mcp.json", include_in_schema=False)
+    async def get_mcp_server_card():
+        """Returns official MCP server card metadata."""
+        public_url = (
+            os.getenv("PUBLIC_API_URL")
+            or os.getenv("WEB3_AGENT_URL")
+            or "https://web3-systemic-agent.onrender.com"
+        ).rstrip("/")
+        mcp: Optional[Web3SystemicMCPServer] = getattr(app.state, "mcp_server", None)
+        if mcp is None:
+            mcp = Web3SystemicMCPServer(engine=getattr(app.state, "engine", None))
+            app.state.mcp_server = mcp
+
+        card = {
+            "serverInfo": {
+                "name": "io.github.RafaCoelho33/web3-systemic-agent",
+                "title": "Web3 Systemic Agent",
+                "version": "1.0.0",
+            },
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "transport": "streamable-http",
+            "remotes": [
+                {
+                    "type": "streamable-http",
+                    "url": f"{public_url}/mcp",
+                }
+            ],
+            "authentication": {
+                "required": False,
+                "schemes": ["none", "x402"],
+            },
+            "tools": mcp.get_tools_manifest(),
+            "resources": [],
+            "prompts": [],
+        }
+        return JSONResponse(status_code=status.HTTP_200_OK, content=card)
+
+    @app.get("/.well-known/agent.json", include_in_schema=False)
+    async def get_agent_card():
+        """Returns Agent-to-Agent (A2A) agent discovery card."""
+        public_url = (
+            os.getenv("PUBLIC_API_URL")
+            or os.getenv("WEB3_AGENT_URL")
+            or "https://web3-systemic-agent.onrender.com"
+        ).rstrip("/")
+        x402_cfg: X402Config = getattr(app.state, "x402_config", None) or X402Config()
+        mcp: Optional[Web3SystemicMCPServer] = getattr(app.state, "mcp_server", None)
+        if mcp is None:
+            mcp = Web3SystemicMCPServer(engine=getattr(app.state, "engine", None))
+            app.state.mcp_server = mcp
+
+        agent_card = {
+            "name": "Web3 Systemic Agent",
+            "id": "io.github.RafaCoelho33/web3-systemic-agent",
+            "version": "1.0.0",
+            "description": (
+                "Autonomous Web3 Security and Governance Auditor Agent with Two-Stage "
+                "Hybrid Architecture (zero-cost on-chain gatekeeping + Gemini LLM semantic audits) "
+                "and x402 Bazaar Micropayments."
+            ),
+            "url": public_url,
+            "capabilities": {
+                "mcp": True,
+                "x402": True,
+                "streaming": False,
+            },
+            "payment": {
+                "protocol": "x402",
+                "network": x402_cfg.network,
+                "price_usdc": x402_cfg.price_per_eval_usdc,
+                "pay_to_address": x402_cfg.pay_to_address,
+            },
+            "endpoints": {
+                "mcp": "/mcp",
+                "evaluate": "/evaluate",
+                "validate_rule": "/rules/validate",
+                "llms_txt": "/llms.txt",
+                "server_card": "/.well-known/mcp/server-card.json",
+            },
+            "skills": mcp.get_tools_manifest(),
+        }
+        return JSONResponse(status_code=status.HTTP_200_OK, content=agent_card)
+
+    @app.get("/.well-known/security.txt", include_in_schema=False)
+    @app.get("/security.txt", include_in_schema=False)
+    async def get_security_txt():
+        """Returns RFC 9116 security vulnerability reporting policy."""
+        return Response(content=SECURITY_TXT_CONTENT, media_type="text/plain; charset=utf-8")
 
     @app.get(
         "/health",
