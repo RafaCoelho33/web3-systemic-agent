@@ -80,6 +80,9 @@ class TestMCPProtocolHandshakeAndDiscovery:
         assert "prompts" in result["capabilities"]
         assert result["serverInfo"]["name"] == "web3-systemic-agent"
         assert result["serverInfo"]["version"] == "1.0.0"
+        assert "instructions" in result
+        assert isinstance(result["instructions"], str)
+        assert len(result["instructions"].strip()) > 0
 
     @pytest.mark.asyncio
     async def test_mcp_notifications_initialized(self, server: Web3SystemicMCPServer):
@@ -108,7 +111,17 @@ class TestMCPProtocolHandshakeAndDiscovery:
 
     @pytest.mark.asyncio
     async def test_mcp_tools_list_schema(self, server: Web3SystemicMCPServer):
-        """Validates 'tools/list' returns all 4 required tools with valid JSON Schemas."""
+        """Validates 'tools/list' and get_tools_manifest() return all 4 required tools with valid inputSchema and outputSchema."""
+        manifest = server.get_tools_manifest()
+        assert len(manifest) == 4
+        for t in manifest:
+            assert "outputSchema" in t, f"Tool {t.get('name')} in get_tools_manifest() missing 'outputSchema'"
+            out_schema = t["outputSchema"]
+            assert isinstance(out_schema, dict), f"Tool {t.get('name')} 'outputSchema' must be a dict"
+            assert out_schema.get("type") == "object", f"Tool {t.get('name')} 'outputSchema' type must be 'object'"
+            assert "properties" in out_schema, f"Tool {t.get('name')} 'outputSchema' missing 'properties'"
+            assert isinstance(out_schema["properties"], dict)
+
         req = {
             "jsonrpc": "2.0",
             "id": 2,
@@ -136,6 +149,12 @@ class TestMCPProtocolHandshakeAndDiscovery:
             assert schema["type"] == "object"
             assert "properties" in schema
             assert isinstance(schema["properties"], dict)
+            assert "outputSchema" in t, f"Tool {name} in tools/list missing 'outputSchema'"
+            out_schema = t["outputSchema"]
+            assert isinstance(out_schema, dict), f"Tool {name} 'outputSchema' must be a dict"
+            assert out_schema.get("type") == "object", f"Tool {name} 'outputSchema' type must be 'object'"
+            assert "properties" in out_schema, f"Tool {name} 'outputSchema' missing 'properties'"
+            assert isinstance(out_schema["properties"], dict)
 
     @pytest.mark.asyncio
     async def test_mcp_tools_manifest_annotations_and_hints(self, server: Web3SystemicMCPServer):

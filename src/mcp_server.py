@@ -161,9 +161,12 @@ class Web3SystemicMCPServer:
             {
                 "name": "scan_contract_selectors",
                 "description": (
-                    "Stage 1 Free deterministic inspection of smart contract bytecode on Base or EVM chains. "
-                    "Discovers 4-byte function selectors and flags high-risk administrative capabilities "
-                    "(ownership transfer, proxy upgrade, unconstrained minting, selfdestruct)."
+                    "Stage 1 Free ($0.00) deterministic EVM bytecode inspector that extracts 4-byte function "
+                    "selectors and flags privileged backdoors (transferOwnership, upgradeTo, mint, selfdestruct). "
+                    "Queries live RPC for chain_id (8453 Base, 84532 Base Sepolia, 42161 Arbitrum) unless "
+                    "bytecode_override (0x hex) is supplied for offline analysis; falls back to empty bytecode on RPC error. "
+                    "Returns JSON with is_contract, bytecode_size_bytes, selectors_found, high_risk_selectors, "
+                    "risk_level (HIGH, LOW, EOA), and recommendation."
                 ),
                 "annotations": {
                     "title": "Scan Smart Contract Bytecode & Selectors",
@@ -191,13 +194,33 @@ class Web3SystemicMCPServer:
                     },
                     "required": ["target_address"],
                 },
+                "outputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tool": {"type": "string"},
+                        "stage": {"type": "integer"},
+                        "cost_usd": {"type": "number"},
+                        "target_address": {"type": "string"},
+                        "chain_id": {"type": "integer"},
+                        "is_contract": {"type": "boolean"},
+                        "bytecode_size_bytes": {"type": "integer"},
+                        "selectors_found": {"type": "array", "items": {"type": "string"}},
+                        "high_risk_selectors": {"type": "array", "items": {"type": "object"}},
+                        "risk_level": {"type": "string", "enum": ["HIGH", "LOW", "EOA"]},
+                        "recommendation": {"type": "string"},
+                    },
+                    "required": ["target_address", "is_contract", "selectors_found", "high_risk_selectors", "risk_level"],
+                },
             },
             {
                 "name": "check_token_honeypot",
                 "description": (
-                    "Stage 1 Free static bytecode scanner for honeypot indicators on DEX tokens: "
-                    "blacklist manipulation (isBlacklisted, setBlacklist), arbitrary transfer taxes / 100% sell fee traps, "
-                    "trading freeze backdoors, and selfdestruct opcodes."
+                    "Stage 1 Free ($0.00) static DEX token bytecode scanner that detects blacklist traps "
+                    "(isBlacklisted, setBlacklist), 100% sell-tax modifiers (setTax, setFee), trading freezes (pause), "
+                    "and SELFDESTRUCT opcodes. Fetches live token_address bytecode on chain_id unless bytecode_override "
+                    "(0x hex) is provided for offline execution; returns safe EOA status if bytecode is empty. "
+                    "Returns JSON with is_contract, is_honeypot_suspect (bool), risk_score (0.0-10.0), "
+                    "threat_categories, risk_flags, and recommendation."
                 ),
                 "annotations": {
                     "title": "Check Token Honeypot & Tax Traps",
@@ -225,12 +248,34 @@ class Web3SystemicMCPServer:
                     },
                     "required": ["token_address"],
                 },
+                "outputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tool": {"type": "string"},
+                        "stage": {"type": "integer"},
+                        "cost_usd": {"type": "number"},
+                        "token_address": {"type": "string"},
+                        "chain_id": {"type": "integer"},
+                        "is_contract": {"type": "boolean"},
+                        "bytecode_size_bytes": {"type": "integer"},
+                        "is_honeypot_suspect": {"type": "boolean"},
+                        "risk_score": {"type": "number"},
+                        "threat_categories": {"type": "array", "items": {"type": "string"}},
+                        "risk_flags": {"type": "array", "items": {"type": "string"}},
+                        "recommendation": {"type": "string"},
+                    },
+                    "required": ["token_address", "is_honeypot_suspect", "risk_score", "threat_categories", "risk_flags"],
+                },
             },
             {
                 "name": "scan_dao_proposals",
                 "description": (
-                    "Stage 1 Free scanner for recent Snapshot DAO governance proposals (Arbitrum, Aave, ENS). "
-                    "Extracts on-chain target addresses and calldata execution payloads to detect governance takeover attempts and discrepancies."
+                    "Stage 1 Free ($0.00) governance scanner that fetches up to limit (1-20) recent Snapshot DAO "
+                    "proposals for space_id (e.g. arbitrumfoundation.eth, aavedao.eth, ens.eth) and extracts on-chain "
+                    "target addresses and calldata to spot hostile takeover payloads. Queries Snapshot GraphQL API "
+                    "by default, or falls back to deterministic offline fixtures when use_curated_offline=true or "
+                    "network fails. Returns JSON with space_id, proposals_count, proposals (id, title, target_address, "
+                    "calldata, value_wei, state), and recommendation."
                 ),
                 "annotations": {
                     "title": "Scan Snapshot DAO Governance Proposals",
@@ -259,14 +304,30 @@ class Web3SystemicMCPServer:
                         },
                     },
                 },
+                "outputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tool": {"type": "string"},
+                        "stage": {"type": "integer"},
+                        "cost_usd": {"type": "number"},
+                        "space_id": {"type": "string"},
+                        "proposals_count": {"type": "integer"},
+                        "proposals": {"type": "array", "items": {"type": "object"}},
+                        "recommendation": {"type": "string"},
+                    },
+                    "required": ["space_id", "proposals_count", "proposals"],
+                },
             },
             {
                 "name": "deep_semantic_audit",
                 "description": (
-                    "Stage 2 Deep Semantic LLM Security and Governance Audit. "
-                    "Performs deterministic on-chain gatekeeping followed by structured Gemini LLM evaluation "
-                    "over natural language proposal claims vs bytecode and calldata reality. "
-                    "Requires $0.05 USDC x402 micropayment on Base Mainnet."
+                    "Stage 2 Paid ($0.05 USDC via x402 on Base Mainnet) hybrid audit combining Stage 1 on-chain "
+                    "gatekeeping with Stage 2 Gemini LLM evaluation to verify proposal_description claims against "
+                    "target_address bytecode and calldata under policy_prompt. Non-idempotent due to LLM evaluation "
+                    "and single-use EIP-3009 x402_payment_header nonce; omitting x402_payment_header safely returns "
+                    "an HTTP 402 payment challenge without charging. Breaching risk_threshold (0.0-10.0) escalates "
+                    "decision to REJECT. Returns JSON with status, decision (APPROVE, MANUAL_REVIEW, REJECT), "
+                    "risk_score, reasoning, and flagged_issues."
                 ),
                 "annotations": {
                     "title": "Deep Semantic LLM Governance & Contract Audit (x402)",
@@ -315,6 +376,21 @@ class Web3SystemicMCPServer:
                         },
                     },
                     "required": ["target_address", "proposal_description"],
+                },
+                "outputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tool": {"type": "string"},
+                        "stage": {"type": "integer"},
+                        "status": {"type": "string", "enum": ["completed", "payment_required"]},
+                        "status_code": {"type": "integer"},
+                        "decision": {"type": "string"},
+                        "risk_score": {"type": "number"},
+                        "reasoning": {"type": "string"},
+                        "flagged_issues": {"type": "array", "items": {"type": "string"}},
+                        "llm_invoked": {"type": "boolean"},
+                    },
+                    "required": ["tool", "stage", "status"],
                 },
             },
         ]
@@ -578,6 +654,12 @@ class Web3SystemicMCPServer:
                         "name": MCP_SERVER_NAME,
                         "version": MCP_SERVER_VERSION,
                     },
+                    "instructions": (
+                        "Use the three free Stage 1 tools (scan_contract_selectors, check_token_honeypot, "
+                        "scan_dao_proposals) first for zero-cost deterministic screening. Escalate to the "
+                        "paid Stage 2 tool (deep_semantic_audit, $0.05 USDC via x402 on Base) only when "
+                        "high-risk selectors, honeypot traps, or suspicious governance calldata are detected."
+                    ),
                 },
             }
 

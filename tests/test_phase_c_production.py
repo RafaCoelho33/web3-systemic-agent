@@ -651,28 +651,27 @@ class TestPhaseCSecurityHardening:
 
 
 class TestRepositoryLicense:
-    """Validates repository licensing and noncommercial usage terms."""
+    """Validates repository licensing and usage terms under Apache License 2.0."""
 
-    def test_license_is_polyform_noncommercial(self):
-        """LICENSE file must exist at repo root and declare PolyForm Noncommercial License 1.0.0."""
+    def test_license_is_apache_2_0(self):
+        """LICENSE, README.md, and pyproject.toml must declare Apache License 2.0."""
         license_path = Path(ROOT_DIR) / "LICENSE"
         readme_path = Path(ROOT_DIR) / "README.md"
+        pyproject_path = Path(ROOT_DIR) / "pyproject.toml"
 
         assert license_path.is_file(), f"LICENSE file must exist at repo root: {license_path}"
         assert readme_path.is_file(), f"README.md file must exist at repo root: {readme_path}"
+        assert pyproject_path.is_file(), f"pyproject.toml file must exist at repo root: {pyproject_path}"
 
         license_content = license_path.read_text(encoding="utf-8")
-        assert "PolyForm Noncommercial License 1.0.0" in license_content, (
-            "LICENSE must contain 'PolyForm Noncommercial License 1.0.0'"
-        )
-        assert "Required Notice: Copyright (c) 2026 RafaCoelho33" in license_content, (
-            "LICENSE must contain 'Required Notice: Copyright (c) 2026 RafaCoelho33'"
-        )
+        assert "Apache License" in license_content, "LICENSE must contain 'Apache License'"
+        assert "Version 2.0" in license_content, "LICENSE must contain 'Version 2.0'"
 
         readme_content = readme_path.read_text(encoding="utf-8")
-        assert "PolyForm Noncommercial" in readme_content, (
-            "README.md must contain 'PolyForm Noncommercial'"
-        )
+        assert "Apache License 2.0" in readme_content, "README.md must contain 'Apache License 2.0'"
+
+        pyproject_content = pyproject_path.read_text(encoding="utf-8")
+        assert 'license = "Apache-2.0"' in pyproject_content, "pyproject.toml must declare 'Apache-2.0'"
 
 
 class TestPhaseCBazaarAndCDPMainnet:
