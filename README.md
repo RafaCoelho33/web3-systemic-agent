@@ -5,7 +5,7 @@
 [![Base](https://img.shields.io/badge/network-Base%20Mainnet%20%7C%20Sepolia-0052FF.svg)](https://base.org)
 [![x402 Protocol](https://img.shields.io/badge/payment-x402%20(EIP--3009%20USDC)-2775C9.svg)](https://x402.org)
 [![MCP Server](https://img.shields.io/badge/MCP-2024--11--05-brightgreen.svg)](https://modelcontextprotocol.io)
-[![M8ven Score](https://m8ven.ai/badge/mcp/rafacoelho33-web3-systemic-agent-jkr9w6?v=b8cb92e3a028ef735eadab3a88daa0cf)](https://m8ven.ai/mcp/rafacoelho33-web3-systemic-agent-jkr9w6?s=readme)
+[![M8ven Score](https://m8ven.ai/badge/mcp/rafacoelho33/web3-systemic-agent)](https://m8ven.ai/mcp/rafacoelho33/web3-systemic-agent?s=readme)
 [![Gemini 2.5/3.5](https://img.shields.io/badge/LLM-Google%20Gemini-orange.svg)](https://ai.google.dev/)
 [![License: PolyForm Noncommercial](https://img.shields.io/badge/License-PolyForm%20Noncommercial-lightgrey.svg)](LICENSE)
 
