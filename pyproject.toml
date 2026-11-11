@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "web3-systemic-agent"
+version = "1.0.1"
+description = "Autonomous Web3 Security and Governance Auditor MCP Server with Two-Stage Hybrid LLM Pipeline and x402 Micropayments"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [
+    { name = "RafaCoelho33" }
+]
+dependencies = [
+    "web3>=8.0.0",
+    "pydantic>=2.13.4",
+    "fastapi>=0.141.1",
+    "uvicorn>=0.49.0",
+    "httpx>=0.28.1",
+    "openai>=3.39.0",
+    "google-genai>=2.33.0",
+    "python-dotenv>=1.2.2",
+    "aiosqlite>=0.20.0",
+    "x402>=2.0.0",
+]
+
+[project.urls]
+Homepage = "https://web3-systemic-agent.onrender.com"
+Repository = "https://github.com/RafaCoelho33/web3-systemic-agent"
+
+[project.scripts]
+web3-systemic-agent-mcp = "src.mcp_server:main"

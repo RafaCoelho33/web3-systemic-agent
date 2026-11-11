@@ -8,7 +8,7 @@
 [![mcptry](https://mcptry.com/badge/io.github.RafaCoelho33/web3-systemic-agent)](https://mcptry.com/servers/io.github.RafaCoelho33/web3-systemic-agent)
 [![M8ven Score](https://m8ven.ai/badge/mcp/rafacoelho33/web3-systemic-agent)](https://m8ven.ai/mcp/rafacoelho33/web3-systemic-agent?s=readme)
 [![Gemini 2.5/3.5](https://img.shields.io/badge/LLM-Google%20Gemini-orange.svg)](https://ai.google.dev/)
-[![License: PolyForm Noncommercial](https://img.shields.io/badge/License-PolyForm%20Noncommercial-lightgrey.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 An autonomous Web3 agent engineered for real-time smart contract monitoring, DEX honeypot detection, and DAO governance security. Features a **two-stage hybrid architecture** that combines zero-cost deterministic on-chain gatekeeping with structured Gemini LLM evaluations, monetized Agent-to-Agent (A2A) via **x402 gasless USDC micropayments** on Base.
 
@@ -343,8 +343,6 @@ pytest
 
 ## 📜 License
 
-This project is licensed under the **[PolyForm Noncommercial License 1.0.0](LICENSE)**.
+This project is licensed under the **[Apache License 2.0](LICENSE)** (`SPDX-License-Identifier: Apache-2.0`).
 
-* **Permitted:** Non-commercial use, research, educational study, and personal experimentation.
-* **Prohibited:** Commercial use, hosting as a paid commercial service, or embedding in proprietary enterprise offerings without a commercial license.
-* **Commercial Inquiries:** Contact https://github.com/RafaCoelho33 for commercial licensing agreements.
+* **Copyright:** Copyright (c) 2026 [RafaCoelho33](https://github.com/RafaCoelho33). All rights reserved under Apache-2.0 terms (including trademark protection under Section 6 and mandatory attribution under Section 4).
