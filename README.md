@@ -119,6 +119,15 @@ The agent provides a first-class **Model Context Protocol (MCP)** server (`src/m
 
 ## 🛠️ MCP Client Configuration & Installation
 
+### One-Command Execution (`uvx` / `pip`)
+
+Run the MCP server directly without manual cloning:
+
+```bash
+# Run directly with uvx (Zero manual setup)
+uvx --from git+https://github.com/RafaCoelho33/web3-systemic-agent web3-systemic-agent --dry-run
+```
+
 ### Claude Desktop
 
 Add the server to your `claude_desktop_config.json`:

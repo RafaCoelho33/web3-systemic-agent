@@ -672,6 +672,54 @@ class TestMCPManifestsAndDryRunCLI:
             "server.json icons must contain 'https://web3-systemic-agent.onrender.com/icon.svg'"
         )
 
+    def test_pyproject_toml_packaging_and_entrypoints(self):
+        """
+        Validates pyproject.toml packaging configuration using Python 3.11's tomllib:
+        1. Verifies pyproject.toml exists and parses cleanly with tomllib.loads().
+        2. Verifies project['name'] == 'web3-systemic-agent', project['license'] == 'Apache-2.0',
+           and project['scripts'] contains both 'web3-systemic-agent' and 'web3-systemic-agent-mcp'
+           pointing to 'src.mcp_server:main'.
+        3. Verifies tool.setuptools.packages.find includes 'src*' and 'scripts*'.
+        """
+        import tomllib
+
+        pyproject_path = Path(ROOT_DIR) / "pyproject.toml"
+        assert pyproject_path.exists(), "pyproject.toml must exist in repo root"
+
+        content = pyproject_path.read_text(encoding="utf-8")
+        data = tomllib.loads(content)
+
+        assert "project" in data, "pyproject.toml must contain [project] table"
+        project = data["project"]
+
+        assert project.get("name") == "web3-systemic-agent"
+        assert project.get("license") == "Apache-2.0"
+
+        scripts = project.get("scripts", {})
+        assert "web3-systemic-agent" in scripts, (
+            "project.scripts must contain 'web3-systemic-agent'"
+        )
+        assert scripts["web3-systemic-agent"] == "src.mcp_server:main"
+
+        assert "web3-systemic-agent-mcp" in scripts, (
+            "project.scripts must contain 'web3-systemic-agent-mcp'"
+        )
+        assert scripts["web3-systemic-agent-mcp"] == "src.mcp_server:main"
+
+        tool_find = data.get("tool", {}).get("setuptools", {}).get("packages", {}).get("find", {})
+        all_values = []
+        for val in tool_find.values():
+            if isinstance(val, list):
+                all_values.extend(val)
+            elif isinstance(val, str):
+                all_values.append(val)
+        assert any("src" in x for x in all_values), (
+            "tool.setuptools.packages.find must include 'src*'"
+        )
+        assert any("scripts" in x for x in all_values), (
+            "tool.setuptools.packages.find must include 'scripts*'"
+        )
+
     def test_readme_mentions_mcp_server_and_tools(self):
         """Verifies README.md documents the MCP server, transport modes, and tool signatures."""
         readme_path = Path(ROOT_DIR) / "README.md"

@@ -12,6 +12,16 @@ license = "Apache-2.0"
 authors = [
     { name = "RafaCoelho33" }
 ]
+keywords = ["mcp", "model-context-protocol", "web3", "base", "ethereum", "security", "honeypot", "dao", "x402", "smart-contracts"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
     "web3>=8.0.0",
     "pydantic>=2.13.4",
@@ -30,4 +40,9 @@ Homepage = "https://web3-systemic-agent.onrender.com"
 Repository = "https://github.com/RafaCoelho33/web3-systemic-agent"
 
 [project.scripts]
+web3-systemic-agent = "src.mcp_server:main"
 web3-systemic-agent-mcp = "src.mcp_server:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*", "scripts*"]
