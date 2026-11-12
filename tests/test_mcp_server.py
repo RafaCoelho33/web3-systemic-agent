@@ -735,6 +735,41 @@ class TestMCPManifestsAndDryRunCLI:
         assert "deep_semantic_audit" in content
         assert "--dry-run" in content
 
+    def test_pypi_packaging_readme_gitignore_and_workflow(self):
+        """
+        Validates PyPI packaging distribution configuration:
+        - README.md contains <!-- mcp-name: io.github.RafaCoelho33/web3-systemic-agent --> and PyPI badge link.
+        - .gitignore includes dist/, build/, and *.egg-info/.
+        - .github/workflows/publish-pypi.yml exists and configures id-token: write and pypa/gh-action-pypi-publish.
+        """
+        # 1. README.md verification
+        readme_path = Path(ROOT_DIR) / "README.md"
+        assert readme_path.exists(), "README.md must exist in repo root"
+        readme_text = readme_path.read_text(encoding="utf-8")
+        assert "<!-- mcp-name: io.github.RafaCoelho33/web3-systemic-agent -->" in readme_text, (
+            "README.md must contain '<!-- mcp-name: io.github.RafaCoelho33/web3-systemic-agent -->'"
+        )
+        assert "https://pypi.org/project/web3-systemic-agent/" in readme_text, (
+            "README.md must contain PyPI badge link 'https://pypi.org/project/web3-systemic-agent/'"
+        )
+
+        # 2. .gitignore verification
+        gitignore_path = Path(ROOT_DIR) / ".gitignore"
+        assert gitignore_path.exists(), ".gitignore must exist in repo root"
+        gitignore_text = gitignore_path.read_text(encoding="utf-8")
+        assert "dist/" in gitignore_text, ".gitignore must include 'dist/'"
+        assert "build/" in gitignore_text, ".gitignore must include 'build/'"
+        assert "*.egg-info/" in gitignore_text, ".gitignore must include '*.egg-info/'"
+
+        # 3. GitHub Actions publish workflow verification
+        workflow_path = Path(ROOT_DIR) / ".github" / "workflows" / "publish-pypi.yml"
+        assert workflow_path.exists(), ".github/workflows/publish-pypi.yml must exist"
+        workflow_text = workflow_path.read_text(encoding="utf-8")
+        assert "id-token: write" in workflow_text, "publish-pypi.yml must configure 'id-token: write'"
+        assert "pypa/gh-action-pypi-publish" in workflow_text, (
+            "publish-pypi.yml must use 'pypa/gh-action-pypi-publish'"
+        )
+
     @pytest.mark.asyncio
     async def test_run_dry_run_function_succeeds(self):
         """Verifies calling run_dry_run() directly succeeds and returns exit code 0."""

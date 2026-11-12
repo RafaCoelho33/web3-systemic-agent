@@ -2,6 +2,7 @@
 ### Autonomous Web3 Security & Governance Auditor with Two-Stage Hybrid LLM Pipeline & x402 Bazaar Micropayments
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![PyPI version](https://img.shields.io/pypi/v/web3-systemic-agent.svg)](https://pypi.org/project/web3-systemic-agent/)
 [![Base](https://img.shields.io/badge/network-Base%20Mainnet%20%7C%20Sepolia-0052FF.svg)](https://base.org)
 [![x402 Protocol](https://img.shields.io/badge/payment-x402%20(EIP--3009%20USDC)-2775C9.svg)](https://x402.org)
 [![MCP Server](https://img.shields.io/badge/MCP-2024--11--05-brightgreen.svg)](https://modelcontextprotocol.io)
@@ -356,3 +357,5 @@ pytest
 This project is licensed under the **[Apache License 2.0](LICENSE)** (`SPDX-License-Identifier: Apache-2.0`).
 
 * **Copyright:** Copyright (c) 2026 [RafaCoelho33](https://github.com/RafaCoelho33). All rights reserved under Apache-2.0 terms (including trademark protection under Section 6 and mandatory attribution under Section 4).
+
+<!-- mcp-name: io.github.RafaCoelho33/web3-systemic-agent -->
