@@ -5,8 +5,8 @@ Defines schemas for deterministic conditions, semantic evaluations, payloads, an
 
 from enum import Enum
 import re
-from typing import Dict, Any, Optional, List, Literal
-from pydantic import BaseModel, Field, field_validator
+from typing import Dict, Any, Optional, List, Literal, Union
+from pydantic import BaseModel, Field, field_validator, model_validator
 from web3 import Web3
 
 
@@ -187,4 +187,119 @@ class FinalAgentResponse(BaseModel):
     payment: Optional[PaymentReceipt] = Field(
         default=None, description="x402 payment receipt when paid mode is active"
     )
+
+
+class PreflightSimulationResult(BaseModel):
+    executed: bool = Field(default=False, description="Whether eth_call simulation was executed")
+    success: Optional[bool] = Field(default=None, description="True if eth_call succeeded without reverting")
+    return_data: Optional[str] = Field(default=None, description="Hex return data from eth_call")
+    revert_reason: Optional[str] = Field(default=None, description="Decoded or raw revert reason if transaction reverted")
+    rpc_error: Optional[str] = Field(default=None, description="Infrastructure RPC error if all RPC nodes failed")
+
+
+class PreflightRequest(BaseModel):
+    chain_id: ChainId = Field(default=ChainId.BASE_MAINNET, description="EVM Chain ID")
+    from_address: Optional[str] = Field(default=None, description="Optional sender EVM address")
+    to_address: Optional[str] = Field(default=None, description="Target contract or recipient EVM address")
+    target_address: Optional[str] = Field(default=None, description="Alias for to_address")
+    calldata: str = Field(default="0x", description="Hex transaction calldata")
+    value_wei: int = Field(default=0, ge=0, description="Transaction value in Wei")
+    eip712_typed_data: Optional[Dict[str, Any]] = Field(
+        default=None, description="Optional EIP-712 typed data payload to inspect before signing"
+    )
+    untrusted_text: Optional[str] = Field(
+        default=None,
+        description="Optional untrusted token metadata, router text, or proposal description to scan for Indirect Prompt Injection",
+    )
+    run_simulation: bool = Field(default=True, description="Whether to run eth_call simulation on chain")
+
+    @field_validator("from_address", "to_address", "target_address")
+    @classmethod
+    def validate_and_normalize_address(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or v == "":
+            return None
+        if not Web3.is_address(v):
+            raise ValueError(f"Invalid Ethereum address: {v}")
+        return Web3.to_checksum_address(v)
+
+    @model_validator(mode="after")
+    def harmonize_target_address(self) -> "PreflightRequest":
+        if not self.to_address and self.target_address:
+            self.to_address = self.target_address
+        elif not self.target_address and self.to_address:
+            self.target_address = self.to_address
+        return self
+
+
+class PreflightVerdict(BaseModel):
+    verdict: Literal["ALLOW", "BLOCK", "MANUAL_REVIEW"] = Field(
+        ..., description="Pre-sign firewall verdict"
+    )
+    risk_score: float = Field(..., ge=0.0, le=10.0, description="Calculated risk score from 0.0 to 10.0")
+    chain_id: int = Field(default=8453)
+    target_address: Optional[str] = Field(default=None)
+    decoded_action: Dict[str, Any] = Field(
+        default_factory=dict, description="Decoded function selector, signature, and arguments"
+    )
+    approval_risks: List[str] = Field(
+        default_factory=list, description="Detected unlimited approvals, Permit2, or setApprovalForAll risks"
+    )
+    eip712_findings: List[str] = Field(
+        default_factory=list, description="Risks detected in EIP-712 typed data"
+    )
+    prompt_injection_detected: bool = Field(
+        default=False, description="Whether Indirect Prompt Injection patterns were found"
+    )
+    prompt_injection_signals: List[str] = Field(
+        default_factory=list, description="Matched prompt injection indicators"
+    )
+    simulation: PreflightSimulationResult = Field(default_factory=PreflightSimulationResult)
+    flagged_issues: List[str] = Field(default_factory=list)
+    summary: str = Field(default="", description="Concise technical justification of the preflight verdict")
+    llm_invoked: bool = Field(default=False)
+    payment: Optional[PaymentReceipt] = Field(default=None)
+
+
+class DeepAuditRequest(BaseModel):
+    target_address: Optional[str] = Field(default=None, description="Hex EVM smart contract address to audit")
+    address: Optional[str] = Field(default=None, description="Alias for target_address")
+    contract_address: Optional[str] = Field(default=None, description="Alias for target_address")
+    chain_id: int = Field(default=8453, description="EVM Chain ID")
+    proposal_description: str = Field(
+        default="Deep security audit of smart contract source code, proxy implementation, and administrative privileges.",
+        description="Audit context or proposal claim",
+    )
+    policy_prompt: str = Field(
+        default="Audit verified Solidity source code, proxy implementation storage, and privileged roles for backdoors, reentrancy, arbitrary tax manipulation, or fund drainage.",
+        description="Security policy prompt",
+    )
+    calldata: str = Field(default="0x", description="Optional transaction hex calldata")
+    risk_threshold: float = Field(default=7.0, ge=0.0, le=10.0, description="Risk score threshold")
+    resolve_proxy: bool = Field(
+        default=True, description="Whether to resolve EIP-1967/Beacon proxy implementation slots on-chain"
+    )
+    fetch_verified_source: bool = Field(
+        default=True, description="Whether to fetch verified Solidity source code from Sourcify/Etherscan"
+    )
+
+    @field_validator("target_address", "address", "contract_address")
+    @classmethod
+    def validate_and_normalize_addr(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or v == "":
+            return None
+        if not Web3.is_address(v):
+            raise ValueError(f"Invalid Ethereum address: {v}")
+        return Web3.to_checksum_address(v)
+
+    @model_validator(mode="after")
+    def harmonize_addresses(self) -> "DeepAuditRequest":
+        resolved = self.target_address or self.address or self.contract_address
+        if resolved:
+            self.target_address = resolved
+            if not self.address:
+                self.address = resolved
+            if not self.contract_address:
+                self.contract_address = resolved
+        return self
+
 

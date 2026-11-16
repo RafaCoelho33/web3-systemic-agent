@@ -55,9 +55,23 @@ for _p in (_ROOT_DIR, _SRC_DIR):
 logger = logging.getLogger(__name__)
 
 try:
-    from src.schemas import PaymentReceipt, ConditionRulePayload, FinalAgentResponse
+    from src.schemas import (
+        PaymentReceipt,
+        ConditionRulePayload,
+        FinalAgentResponse,
+        PreflightRequest,
+        PreflightVerdict,
+        DeepAuditRequest,
+    )
 except ImportError:
-    from schemas import PaymentReceipt, ConditionRulePayload, FinalAgentResponse
+    from schemas import (
+        PaymentReceipt,
+        ConditionRulePayload,
+        FinalAgentResponse,
+        PreflightRequest,
+        PreflightVerdict,
+        DeepAuditRequest,
+    )
 
 try:
     from x402 import (
@@ -88,6 +102,8 @@ except ImportError as exc:
 # Protocol Constants
 USDC_DECIMALS: int = 6
 DEFAULT_X402_PRICE_USDC: float = 0.01
+DEFAULT_X402_PRICE_PREFLIGHT_USDC: float = 0.01
+DEFAULT_X402_PRICE_DEEP_AUDIT_USDC: float = 0.25
 DEFAULT_X402_NETWORK: str = "eip155:84532"  # Base Sepolia
 DEFAULT_PAY_TO_ADDRESS: str = "0x0000000000000000000000000000000000000001"
 DEFAULT_FACILITATOR_URL: str = "https://x402.org/facilitator"
@@ -154,6 +170,8 @@ class X402Config(BaseModel):
     """
     enabled: bool = Field(default=False, description="Whether x402 payment gatekeeper is active")
     price_per_eval_usdc: float = Field(default=DEFAULT_X402_PRICE_USDC, ge=0.0, description="Price per evaluation in USDC")
+    price_per_preflight_usdc: float = Field(default=DEFAULT_X402_PRICE_PREFLIGHT_USDC, ge=0.0, description="Price per preflight check in USDC")
+    price_per_deep_audit_usdc: float = Field(default=DEFAULT_X402_PRICE_DEEP_AUDIT_USDC, ge=0.0, description="Price per deep source/proxy audit in USDC")
     network: str = Field(default=DEFAULT_X402_NETWORK, description="CAIP-2 network identifier")
     pay_to_address: str = Field(default=DEFAULT_PAY_TO_ADDRESS, description="Recipient EVM address")
     facilitator_url: str = Field(default=DEFAULT_FACILITATOR_URL, description="Facilitator service URL")
@@ -171,6 +189,20 @@ class X402Config(BaseModel):
             if env_val:
                 try:
                     data["price_per_eval_usdc"] = float(env_val)
+                except (ValueError, TypeError):
+                    pass
+        if "price_per_preflight_usdc" not in data:
+            env_val = os.getenv("X402_PRICE_PREFLIGHT")
+            if env_val:
+                try:
+                    data["price_per_preflight_usdc"] = float(env_val)
+                except (ValueError, TypeError):
+                    pass
+        if "price_per_deep_audit_usdc" not in data:
+            env_val = os.getenv("X402_PRICE_DEEP_AUDIT")
+            if env_val:
+                try:
+                    data["price_per_deep_audit_usdc"] = float(env_val)
                 except (ValueError, TypeError):
                     pass
         if "network" not in data:
@@ -446,15 +478,52 @@ def build_bazaar_discovery_extension(endpoint: str = "/evaluate") -> Dict[str, A
     Constructs an x402 Bazaar auto-discovery extension declaring input/output JSON schemas
     and sample payloads for Agent-to-Agent discovery.
     """
-    clean_endpoint = str(endpoint or "/evaluate").rstrip("/")
-    if clean_endpoint.endswith("/audit"):
+    clean_ep = str(endpoint or "/evaluate").rstrip("/")
+    if clean_ep.endswith("/preflight"):
+        sample_input = {
+            "chain_id": 8453,
+            "to_address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            "calldata": "0x095ea7b30000000000000000000000001111111111111111111111111111111111111111ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "value_wei": 0,
+            "run_simulation": True,
+        }
+        sample_output_example = {
+            "verdict": "BLOCK",
+            "risk_score": 7.5,
+            "chain_id": 8453,
+            "llm_invoked": False,
+        }
+        input_schema = PreflightRequest.model_json_schema()
+        output_schema = PreflightVerdict.model_json_schema()
+    elif clean_ep.endswith("/audit/deep"):
+        sample_input = {
+            "target_address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            "chain_id": 8453,
+            "proposal_description": "Deep audit of EIP-1967 proxy implementation and verified Solidity source code.",
+            "resolve_proxy": True,
+            "fetch_verified_source": True,
+        }
+        sample_output_example = {
+            "rule_id": "deep-audit-01",
+            "chain_id": 8453,
+            "llm_invoked": True,
+        }
+        input_schema = DeepAuditRequest.model_json_schema()
+        output_schema = FinalAgentResponse.model_json_schema()
+    elif clean_ep.endswith("/audit"):
         sample_input = {
             "target_address": "0x4200000000000000000000000000000000000006",
             "chain_id": 8453,
             "proposal_description": "Audit smart contract for administrative backdoors, honeypot traps, or unauthorized privilege escalation.",
             "calldata": "0x",
         }
+        sample_output_example = {
+            "rule_id": "example-audit-01",
+            "chain_id": 8453,
+            "llm_invoked": True,
+        }
         input_schema = QuickAuditRequest.model_json_schema()
+        output_schema = FinalAgentResponse.model_json_schema()
     else:
         sample_input = {
             "rule_id": "example-audit-01",
@@ -476,13 +545,13 @@ def build_bazaar_discovery_extension(endpoint: str = "/evaluate") -> Dict[str, A
                 "tx_value_wei": 0,
             },
         }
+        sample_output_example = {
+            "rule_id": "example-audit-01",
+            "chain_id": 8453,
+            "llm_invoked": True,
+        }
         input_schema = ConditionRulePayload.model_json_schema()
-
-    sample_output_example = {
-        "rule_id": "example-audit-01",
-        "chain_id": 8453,
-        "llm_invoked": True,
-    }
+        output_schema = FinalAgentResponse.model_json_schema()
 
     if HAS_X402_SDK:
         try:
@@ -492,7 +561,7 @@ def build_bazaar_discovery_extension(endpoint: str = "/evaluate") -> Dict[str, A
                 body_type="json",
                 output=OutputConfig(
                     example=sample_output_example,
-                    schema=FinalAgentResponse.model_json_schema(),
+                    schema=output_schema,
                 ),
             )
             if isinstance(res, dict) and "bazaar" in res:
@@ -520,7 +589,7 @@ def build_bazaar_discovery_extension(endpoint: str = "/evaluate") -> Dict[str, A
             },
             "schema": {
                 "input": input_schema,
-                "output": FinalAgentResponse.model_json_schema(),
+                "output": output_schema,
             },
         }
     }

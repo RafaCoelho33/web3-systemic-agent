@@ -39,8 +39,10 @@ The service is continuously deployed and operational in production on [Render](h
 | `GET` | `/mcp` | MCP server discovery, transport metadata, tools manifest | Free |
 | `POST` | `/mcp` | MCP JSON-RPC 2.0 execution endpoint (streamable-http) | Free / 402 for Deep Audit |
 | `POST` | `/rules/validate` | Static deterministic rule pre-validation and syntax check | Free |
+| `GET` / `POST` | `/preflight` | Pre-sign firewall: Permit2/approval decode, EIP-712, IPI & `eth_call` simulation | **0.01 USDC** |
 | `GET` / `POST` | `/audit` | Simplified one-shot Smart Contract Audit (`QuickAuditRequest`) | **0.015 USDC** |
 | `GET` / `POST` | `/evaluate` | Two-stage hybrid evaluation (`ConditionRulePayload` + Gemini LLM) | **0.015 USDC** |
+| `GET` / `POST` | `/audit/deep` | Deep Tier Pro Audit: EIP-1967 proxy resolution + Sourcify/Etherscan source + LLM | **0.25 USDC** |
 | `POST` | `/rules/evaluate-batch` | Synchronous batch evaluation for up to 50 rules | Free / Sub-rules gated |
 | `POST` | `/rules/enqueue` | Asynchronous evaluation queue returning unique `job_id` | Free |
 | `GET` | `/jobs/{job_id}` | Asynchronous job status inspection and results retrieval | Free |

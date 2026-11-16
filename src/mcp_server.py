@@ -47,7 +47,11 @@ try:
         SemanticCondition,
         FinalAgentResponse,
         PaymentReceipt,
+        PreflightRequest,
+        PreflightVerdict,
     )
+    from src.preflight_firewall import PreflightFirewall
+    from src.source_resolver import ContractSourceResolver
     from src.engine import ConditionAgentEngine
     from src.chain_inspector import ChainInspector
     from src.governance_connector import (
@@ -75,7 +79,11 @@ except ImportError:
         SemanticCondition,
         FinalAgentResponse,
         PaymentReceipt,
+        PreflightRequest,
+        PreflightVerdict,
     )
+    from preflight_firewall import PreflightFirewall
+    from source_resolver import ContractSourceResolver
     from engine import ConditionAgentEngine
     from chain_inspector import ChainInspector
     from governance_connector import (
@@ -181,9 +189,9 @@ class Web3SystemicMCPServer:
         self.facilitator = facilitator
         self.storage = storage
 
-    def get_tools_manifest(self) -> List[Dict[str, Any]]:
+    def get_tools_manifest(self, include_extended: bool = False) -> List[Dict[str, Any]]:
         """Returns the canonical MCP tools manifest defining all available tools and their schemas."""
-        return [
+        tools = [
             {
                 "name": "scan_contract_selectors",
                 "description": (
@@ -408,6 +416,16 @@ class Web3SystemicMCPServer:
                             "type": "string",
                             "description": "Optional Base64-encoded EIP-3009 transferWithAuthorization payment header satisfying $0.05 USDC requirement",
                         },
+                        "resolve_proxy": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "If true, resolves EIP-1967/1822 proxy implementation contract and inspects implementation state",
+                        },
+                        "fetch_verified_source": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "If true, fetches verified Solidity source code from block explorers (Etherscan, Basescan, Sourcify)",
+                        },
                     },
                     "required": ["target_address", "proposal_description"],
                 },
@@ -428,6 +446,83 @@ class Web3SystemicMCPServer:
                 },
             },
         ]
+
+        if include_extended:
+            tools.append({
+                "name": "preflight_tx_firewall",
+                "description": (
+                    "Stage 1 Free ($0.00) pre-sign security firewall evaluating EVM transaction risks, "
+                    "calldata decoding, unlimited token approvals, Permit2 signatures, EIP-712 typed data phishing, "
+                    "Indirect Prompt Injections in untrusted calldata/descriptions, and simulated state changes via eth_call. "
+                    "Returns JSON with verdict (ALLOW, BLOCK, MANUAL_REVIEW), risk_score (0.0-10.0), reasons, and simulation details."
+                ),
+                "annotations": {
+                    "title": "Preflight Transaction Security Firewall",
+                    "readOnlyHint": True,
+                    "destructiveHint": False,
+                    "idempotentHint": True,
+                    "openWorldHint": True,
+                },
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "to_address": {
+                            "type": "string",
+                            "description": "Target contract or recipient EVM address",
+                        },
+                        "target_address": {
+                            "type": "string",
+                            "description": "Alias for to_address",
+                        },
+                        "from_address": {
+                            "type": "string",
+                            "description": "Optional sender EVM address",
+                        },
+                        "calldata": {
+                            "type": "string",
+                            "default": "0x",
+                            "description": "Hex transaction calldata",
+                        },
+                        "value_wei": {
+                            "type": "integer",
+                            "default": 0,
+                            "description": "Transaction value in Wei",
+                        },
+                        "chain_id": {
+                            "type": "integer",
+                            "default": 8453,
+                            "description": "EVM Chain ID (default: 8453 for Base Mainnet)",
+                        },
+                        "eip712_typed_data": {
+                            "type": "object",
+                            "description": "Optional EIP-712 typed data dictionary to inspect before signing",
+                        },
+                        "untrusted_text": {
+                            "type": "string",
+                            "description": "Optional untrusted text or proposal description to scan for prompt injection",
+                        },
+                        "run_simulation": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": "Whether to run eth_call simulation on chain",
+                        },
+                    },
+                },
+                "outputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tool": {"type": "string"},
+                        "stage": {"type": "integer"},
+                        "cost_usd": {"type": "number"},
+                        "verdict": {"type": "string", "enum": ["ALLOW", "BLOCK", "MANUAL_REVIEW"]},
+                        "risk_score": {"type": "number"},
+                        "reasons": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["tool", "stage", "verdict", "risk_score"],
+                },
+            })
+
+        return tools
 
     async def scan_contract_selectors(
         self,
@@ -625,6 +720,43 @@ class Web3SystemicMCPServer:
             "rule_payload": payload.model_dump(mode="json"),
         }
 
+    async def preflight_tx_firewall(
+        self,
+        to_address: Optional[str] = None,
+        target_address: Optional[str] = None,
+        from_address: Optional[str] = None,
+        calldata: str = "0x",
+        value_wei: int = 0,
+        chain_id: int = 8453,
+        eip712_typed_data: Optional[Dict[str, Any]] = None,
+        untrusted_text: Optional[str] = None,
+        run_simulation: bool = True,
+    ) -> Dict[str, Any]:
+        """Tool 5: Stage 1 Free pre-sign security firewall evaluating EVM tx risks, calldata, Permit2, EIP-712, prompt injection, and simulations."""
+        try:
+            cid = ChainId(chain_id)
+        except ValueError:
+            cid = ChainId.BASE_MAINNET
+
+        req = PreflightRequest(
+            chain_id=cid,
+            to_address=to_address,
+            target_address=target_address,
+            from_address=from_address,
+            calldata=calldata,
+            value_wei=value_wei,
+            eip712_typed_data=eip712_typed_data,
+            untrusted_text=untrusted_text,
+            run_simulation=run_simulation,
+        )
+        firewall = getattr(self, "preflight_firewall", None) or PreflightFirewall()
+        verdict = await firewall.evaluate(req)
+        dumped = verdict.model_dump(mode="json")
+        dumped["tool"] = "preflight_tx_firewall"
+        dumped["stage"] = 1
+        dumped["cost_usd"] = 0.0
+        return dumped
+
     async def deep_semantic_audit(
         self,
         target_address: str,
@@ -637,6 +769,8 @@ class Web3SystemicMCPServer:
         chain_id: int = 8453,
         risk_threshold: float = 7.0,
         x402_payment_header: Optional[str] = None,
+        resolve_proxy: bool = False,
+        fetch_verified_source: bool = False,
     ) -> Dict[str, Any]:
         """Tool 4: Two-stage on-chain gatekeeping + structured Gemini LLM security audit ($0.05 USDC x402 payment)."""
         checksum_addr = _validate_checksum_address(target_address)
@@ -677,6 +811,21 @@ class Web3SystemicMCPServer:
                 "source": "mcp_server",
             },
         )
+
+        async def _enrich_audit_context():
+            if resolve_proxy or fetch_verified_source:
+                resolver = getattr(self, "source_resolver", None) or ContractSourceResolver()
+                cid_int = int(cid.value if hasattr(cid, "value") else cid)
+                audit_ctx = await resolver.resolve_full_audit_context(
+                    chain_id=cid_int,
+                    target_address=checksum_addr,
+                    resolve_proxy=resolve_proxy,
+                    fetch_source=fetch_verified_source,
+                )
+                payload.context_metadata["proxy_info"] = audit_ctx.get("proxy_info", {})
+                payload.context_metadata["source_info"] = audit_ctx.get("source_info", {})
+                payload.context_metadata["effective_selectors"] = audit_ctx.get("effective_selectors", [])
+                payload.context_metadata["security_warnings"] = audit_ctx.get("security_warnings", [])
 
         if self.require_x402_for_deep_audit:
             if not x402_payment_header and not self.buyer_private_key:
@@ -723,6 +872,9 @@ class Web3SystemicMCPServer:
             if self.engine is None:
                 self.engine = ConditionAgentEngine()
 
+            if resolve_proxy or fetch_verified_source:
+                await _enrich_audit_context()
+
             res = await self.engine.process_rule(payload, source="mcp_server")
 
             if res.deterministic_check.error is not None:
@@ -757,6 +909,10 @@ class Web3SystemicMCPServer:
         else:
             if self.engine is None:
                 self.engine = ConditionAgentEngine()
+
+            if resolve_proxy or fetch_verified_source:
+                await _enrich_audit_context()
+
             res = await self.engine.process_rule(payload, source="mcp_server")
 
         sem = getattr(res, "semantic_Evaluation", None) or getattr(res, "semantic_evaluation", None)
@@ -866,6 +1022,7 @@ class Web3SystemicMCPServer:
                 "check_token_honeypot": self.check_token_honeypot,
                 "scan_dao_proposals": self.scan_dao_proposals,
                 "deep_semantic_audit": self.deep_semantic_audit,
+                "preflight_tx_firewall": self.preflight_tx_firewall,
             }
 
             if tool_name not in known_tools:

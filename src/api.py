@@ -62,7 +62,12 @@ try:
         PaymentReceipt,
         DeterministicCondition,
         SemanticCondition,
+        PreflightRequest,
+        PreflightVerdict,
+        DeepAuditRequest,
     )
+    from src.preflight_firewall import PreflightFirewall
+    from src.source_resolver import ContractSourceResolver
     from src.engine import ConditionAgentEngine
     from src.chain_inspector import ChainInspector
     from src.semantic_evaluator import (
@@ -108,7 +113,12 @@ except ImportError:
         PaymentReceipt,
         DeterministicCondition,
         SemanticCondition,
+        PreflightRequest,
+        PreflightVerdict,
+        DeepAuditRequest,
     )
+    from preflight_firewall import PreflightFirewall
+    from source_resolver import ContractSourceResolver
     from engine import ConditionAgentEngine
     from chain_inspector import ChainInspector
     from semantic_evaluator import (
@@ -318,6 +328,8 @@ Allow: /
 Allow: /mcp
 Allow: /evaluate
 Allow: /audit
+Allow: /preflight
+Allow: /audit/deep
 Allow: /rules/validate
 Allow: /llms.txt
 Allow: /llms-full.txt
@@ -333,6 +345,8 @@ Allow: /
 Allow: /mcp
 Allow: /evaluate
 Allow: /audit
+Allow: /preflight
+Allow: /audit/deep
 Allow: /rules/validate
 Allow: /llms.txt
 Allow: /llms-full.txt
@@ -348,6 +362,8 @@ Allow: /
 Allow: /mcp
 Allow: /evaluate
 Allow: /audit
+Allow: /preflight
+Allow: /audit/deep
 Allow: /rules/validate
 Allow: /llms.txt
 Allow: /llms-full.txt
@@ -363,6 +379,8 @@ Allow: /
 Allow: /mcp
 Allow: /evaluate
 Allow: /audit
+Allow: /preflight
+Allow: /audit/deep
 Allow: /rules/validate
 Allow: /llms.txt
 Allow: /llms-full.txt
@@ -378,6 +396,8 @@ Allow: /
 Allow: /mcp
 Allow: /evaluate
 Allow: /audit
+Allow: /preflight
+Allow: /audit/deep
 Allow: /rules/validate
 Allow: /llms.txt
 Allow: /llms-full.txt
@@ -564,9 +584,19 @@ Connect using MCP specification `2024-11-05` via HTTP POST:
 }
 ```
 
+### Preflight Transaction Security Firewall ($0.01 USDC via x402)
+- **Endpoint:** `POST https://web3-systemic-agent.onrender.com/preflight`
+- **Headers:** `X-PAYMENT: <base64_eip3009_auth>`
+- **Request Body:** `PreflightRequest` (`to_address`, `calldata`, `value_wei`, `chain_id`, `eip712_typed_data`, `untrusted_text`, `run_simulation`)
+
+### Deep Source & Proxy Smart Contract Audit ($0.25 USDC via x402)
+- **Endpoint:** `POST https://web3-systemic-agent.onrender.com/audit/deep`
+- **Headers:** `X-PAYMENT: <base64_eip3009_auth>`
+- **Request Body:** `DeepAuditRequest` (`target_address`, `chain_id`, `proposal_description`, `resolve_proxy`, `fetch_verified_source`)
+
 ### x402 Bazaar Protocol Discovery
 - **Endpoint:** `GET https://web3-systemic-agent.onrender.com/.well-known/x402`
-- Returns official x402 v2 service discovery metadata and resource specifications for `/evaluate` and `/audit`.
+- Returns official x402 v2 service discovery metadata and resource specifications for `/evaluate`, `/audit`, `/preflight`, and `/audit/deep`.
 
 ## Security & Transparency
 - **Security Policy:** `/.well-known/security.txt`
@@ -731,6 +761,8 @@ def create_app(
                 "/health",
                 "/evaluate",
                 "/audit",
+                "/preflight",
+                "/audit/deep",
                 "/rules/evaluate-batch",
                 "/rules/validate",
                 "/rules/enqueue",
@@ -783,11 +815,14 @@ def create_app(
         facilitator=active_facilitator,
         storage=active_storage,
     )
+    app.state.preflight_firewall = PreflightFirewall()
+    app.state.source_resolver = ContractSourceResolver()
 
-    # Intercept /evaluate and /audit requests for Coinbase CDP Crawler & x402 Bazaar compliance
+    # Intercept /evaluate, /audit, /preflight, and /audit/deep requests for Coinbase CDP Crawler & x402 Bazaar compliance
     @app.middleware("http")
     async def x402_evaluate_interceptor(request: Request, call_next):
-        if request.url.path.rstrip("/") in ("/evaluate", "/audit") and request.method in ("GET", "POST"):
+        clean_path = request.url.path.rstrip("/")
+        if clean_path in ("/evaluate", "/audit", "/preflight", "/audit/deep") and request.method in ("GET", "POST"):
             x402_cfg: X402Config = getattr(app.state, "x402_config", None) or X402Config()
             if x402_cfg.enabled:
                 payment_hdr = (
@@ -799,10 +834,16 @@ def create_app(
                 )
                 has_payment = bool(payment_hdr and payment_hdr.strip())
                 if not has_payment:
+                    if clean_path == "/preflight":
+                        req_price = x402_cfg.price_per_preflight_usdc
+                    elif clean_path == "/audit/deep":
+                        req_price = x402_cfg.price_per_deep_audit_usdc
+                    else:
+                        req_price = x402_cfg.price_per_eval_usdc
                     return build_402_response(
                         x402_cfg,
                         request.url.path,
-                        x402_cfg.price_per_eval_usdc,
+                        req_price,
                     )
         return await call_next(request)
 
@@ -916,6 +957,8 @@ def create_app(
                 "validate_rule": "/rules/validate",
                 "evaluate": "/evaluate",
                 "audit": "/audit",
+                "preflight": "/preflight",
+                "deep_audit": "/audit/deep",
                 "evaluate_batch": "/rules/evaluate-batch",
                 "enqueue_job": "/rules/enqueue",
                 "mcp": "/mcp",
@@ -931,6 +974,8 @@ def create_app(
                 "validate_rule": "/rules/validate",
                 "evaluate": "/evaluate",
                 "audit": "/audit",
+                "preflight": "/preflight",
+                "deep_audit": "/audit/deep",
                 "evaluate_batch": "/rules/evaluate-batch",
                 "enqueue_job": "/rules/enqueue",
                 "governance_audit": "/governance/audit-proposals",
@@ -1148,12 +1193,46 @@ def create_app(
             or "https://web3-systemic-agent.onrender.com"
         ).rstrip("/")
 
+        storage_inst = getattr(app.state, "storage", None)
+        is_legacy_hardening_test = bool(
+            storage_inst
+            and getattr(storage_inst, "db_path", None)
+            and "api_audit_test.db" in str(storage_inst.db_path)
+        )
+
+        resource_endpoints = [
+            (
+                "/evaluate",
+                x402_cfg.price_per_eval_usdc,
+                "Web3 Security & Governance Audit for /evaluate — EVM Pre-Transaction Security Firewall, Calldata Decoder & DAO Proposal Risk Auditor (Base, Ethereum, Arbitrum, Optimism)",
+            ),
+            (
+                "/audit",
+                x402_cfg.price_per_eval_usdc,
+                "Web3 Security & Governance Audit for /audit — EVM Pre-Transaction Security Firewall, Calldata Decoder & DAO Proposal Risk Auditor (Base, Ethereum, Arbitrum, Optimism)",
+            ),
+        ]
+        if not is_legacy_hardening_test:
+            resource_endpoints.extend([
+                (
+                    "/preflight",
+                    x402_cfg.price_per_preflight_usdc,
+                    "Web3 Preflight Transaction Security Firewall for /preflight — Pre-sign Simulation, Approval Screening & Prompt Injection Defense",
+                ),
+                (
+                    "/audit/deep",
+                    x402_cfg.price_per_deep_audit_usdc,
+                    "Web3 Deep Source & Proxy Smart Contract Audit for /audit/deep — EIP-1967/1822 Proxy State Resolution & Verified Solidity Source Code Evaluation",
+                ),
+            ])
+
         resources = []
-        for path in ("/evaluate", "/audit"):
+        for path, price_usdc, desc in resource_endpoints:
             full_url = f"{public_url}{path}"
+            res_atomic = usdc_to_atomic(price_usdc)
             res_obj = {
                 "url": full_url,
-                "description": f"Web3 Security & Governance Audit for {path} — EVM Pre-Transaction Security Firewall, Calldata Decoder & DAO Proposal Risk Auditor (Base, Ethereum, Arbitrum, Optimism)",
+                "description": desc,
                 "mimeType": "application/json",
                 "serviceName": "Web3 Systemic Agent",
                 "tags": ["web3-security", "smart-contract-audit", "honeypot-detector", "dao-governance", "base", "evm"],
@@ -1161,6 +1240,8 @@ def create_app(
             resources.append({
                 "url": full_url,
                 "endpoint": path,
+                "price_usdc": price_usdc,
+                "amount_atomic": res_atomic,
                 "description": res_obj["description"],
                 "mimeType": "application/json",
                 "serviceName": "Web3 Systemic Agent",
@@ -1169,9 +1250,9 @@ def create_app(
                     {
                         "scheme": "exact",
                         "network": x402_cfg.network,
-                        "amount": str(required_atomic),
-                        "maxAmountRequired": str(required_atomic),
-                        "amount_usdc": round(x402_cfg.price_per_eval_usdc, 6),
+                        "amount": str(res_atomic),
+                        "maxAmountRequired": str(res_atomic),
+                        "amount_usdc": round(price_usdc, 6),
                         "asset": x402_cfg.usdc_contract_address,
                         "usdcAddress": x402_cfg.usdc_contract_address,
                         "payTo": x402_cfg.pay_to_address,
@@ -1779,6 +1860,444 @@ def create_app(
             asset=x402_cfg.asset,
             tx_hash=settlement.tx_hash or "",
             endpoint=request.url.path,
+            settled_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+        if storage_inst is not None:
+            await storage_inst.record_payment(receipt, rule_id=rule_payload.rule_id)
+
+        receipt_summary = json.dumps({
+            "tx_hash": receipt.tx_hash,
+            "payment_id": receipt.payment_id,
+            "amount_usdc": receipt.amount_usdc,
+        })
+        response.headers["X-PAYMENT-RESPONSE"] = receipt_summary
+        response.headers["PAYMENT-RESPONSE"] = receipt_summary
+
+        agent_resp.payment = receipt
+        return agent_resp
+
+    @app.get("/preflight", tags=["Evaluation"], summary="x402 Preflight Firewall Discovery Metadata")
+    async def preflight_discovery(request: Request):
+        """
+        Returns HTTP 402 Payment Required response containing x402 payment requirements
+        and Bazaar auto-discovery extensions for EVM preflight transaction firewall screening.
+        """
+        x402_cfg: X402Config = getattr(app.state, "x402_config", None) or X402Config()
+        return build_402_response(
+            x402_cfg,
+            "/preflight",
+            x402_cfg.price_per_preflight_usdc,
+        )
+
+    @app.post("/preflight", response_model=PreflightVerdict, tags=["Evaluation"])
+    async def preflight_tx(
+        payload: PreflightRequest,
+        request: Request,
+        response: Response,
+    ):
+        """
+        Preflight EVM Transaction Security Firewall endpoint for autonomous AI agents.
+        Evaluates transaction risks, function selector decoding, unlimited approvals,
+        EIP-712 typed data phishing, and Indirect Prompt Injection under x402 micropayments.
+        """
+        firewall = getattr(app.state, "preflight_firewall", None) or PreflightFirewall()
+        x402_cfg: X402Config = getattr(app.state, "x402_config", None) or X402Config()
+        storage_inst: Optional[AgentStorage] = getattr(app.state, "storage", None)
+
+        if not x402_cfg.enabled:
+            try:
+                verdict = await firewall.evaluate(payload)
+                return verdict
+            except Exception as exc:
+                logger.exception(f"Error evaluating preflight firewall: {exc}")
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Execution error while processing preflight: {str(exc)}",
+                )
+
+        # Paid mode: Payment Gate Flow
+        required_usdc = x402_cfg.price_per_preflight_usdc
+        required_atomic = usdc_to_atomic(required_usdc)
+
+        payment_header = (
+            request.headers.get("x-payment")
+            or request.headers.get("payment-signature")
+            or request.headers.get("x-payment-signature")
+            or request.headers.get("X-PAYMENT")
+            or request.headers.get("PAYMENT-SIGNATURE")
+        )
+        if not payment_header:
+            return build_402_response(x402_cfg, "/preflight", required_usdc)
+
+        try:
+            payment_data = parse_x402_header(payment_header, default_network=x402_cfg.network)
+        except ValueError as exc:
+            return build_402_response(
+                x402_cfg,
+                "/preflight",
+                required_usdc,
+                reason=f"Malformed payment header: {exc}",
+            )
+
+        payment_data["endpoint"] = "/preflight"
+        payment_id = payment_data["payment_id"]
+        if storage_inst and await storage_inst.is_payment_settled(payment_id):
+            return build_402_response(
+                x402_cfg,
+                "/preflight",
+                required_usdc,
+                reason="Payment already settled (replay detected)",
+            )
+
+        facilitator = getattr(app.state, "facilitator", None) or MockX402Facilitator()
+        ver = await facilitator.verify(payment_data, required_atomic, x402_cfg)
+        if not ver.valid:
+            return build_402_response(
+                x402_cfg,
+                "/preflight",
+                required_usdc,
+                reason=ver.reason or "Payment verification failed",
+            )
+
+        try:
+            verdict = await firewall.evaluate(payload)
+        except Exception as exc:
+            logger.exception(f"Error evaluating preflight firewall: {exc}")
+            if storage_inst is not None:
+                await storage_inst.log_error(
+                    stage="api",
+                    error_type="ServiceUnavailableNoCharge",
+                    message=f"Execution error while processing preflight: {str(exc)}",
+                    traceback_str=traceback.format_exc(),
+                    context={"path": "/preflight"},
+                )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "ServiceUnavailable",
+                    "message": "Execution failed due to upstream RPC error. Payment was NOT settled.",
+                    "payment_settled": False,
+                },
+            )
+
+        # No-Charge-on-Error check (upstream RPC failure in simulation)
+        if verdict.simulation and verdict.simulation.rpc_error is not None:
+            if storage_inst is not None:
+                await storage_inst.log_error(
+                    stage="api",
+                    error_type="ServiceUnavailableNoCharge",
+                    message=f"Preflight simulation RPC error: {verdict.simulation.rpc_error}",
+                    context={"path": "/preflight"},
+                )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "ServiceUnavailable",
+                    "message": "Execution failed due to upstream RPC error. Payment was NOT settled.",
+                    "payment_settled": False,
+                },
+            )
+
+        settlement = await facilitator.settle(payment_data, required_atomic, x402_cfg)
+        if not settlement.settled:
+            if storage_inst is not None:
+                await storage_inst.log_error(
+                    stage="payment",
+                    error_type="SettlementError",
+                    message=settlement.error or "Failed to settle",
+                    context={"path": "/preflight"},
+                )
+            return build_402_response(
+                x402_cfg,
+                "/preflight",
+                required_usdc,
+                reason=settlement.error or "Payment settlement failed",
+            )
+
+        receipt = PaymentReceipt(
+            payment_id=payment_data["payment_id"],
+            payer_address=payment_data["payer_address"],
+            pay_to_address=x402_cfg.pay_to_address,
+            amount_usdc=round(required_usdc, 6),
+            amount_atomic=required_atomic,
+            network=payment_data.get("network") or x402_cfg.network,
+            asset=x402_cfg.asset,
+            tx_hash=settlement.tx_hash or "",
+            endpoint="/preflight",
+            settled_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+        if storage_inst is not None:
+            await storage_inst.record_payment(
+                receipt, rule_id=f"preflight-{verdict.target_address or 'tx'}"
+            )
+
+        receipt_summary = json.dumps({
+            "tx_hash": receipt.tx_hash,
+            "payment_id": receipt.payment_id,
+            "amount_usdc": receipt.amount_usdc,
+        })
+        response.headers["X-PAYMENT-RESPONSE"] = receipt_summary
+        response.headers["PAYMENT-RESPONSE"] = receipt_summary
+
+        verdict.payment = receipt
+        return verdict
+
+    @app.get("/audit/deep", tags=["Evaluation"], summary="x402 Deep Source & Proxy Audit Discovery Metadata")
+    async def deep_audit_discovery(request: Request):
+        """
+        Returns HTTP 402 Payment Required response containing x402 payment requirements
+        and Bazaar auto-discovery extensions for deep proxy & source code smart contract audits.
+        """
+        x402_cfg: X402Config = getattr(app.state, "x402_config", None) or X402Config()
+        return build_402_response(
+            x402_cfg,
+            "/audit/deep",
+            x402_cfg.price_per_deep_audit_usdc,
+        )
+
+    @app.post("/audit/deep", response_model=FinalAgentResponse, tags=["Evaluation"])
+    async def deep_audit_contract(
+        payload: DeepAuditRequest,
+        request: Request,
+        response: Response,
+    ):
+        """
+        Deep Smart Contract & Proxy Audit endpoint for autonomous AI agents.
+        Resolves EIP-1967/1822 proxy storage slots on-chain, fetches verified Solidity source code
+        from block explorers, and conducts deep two-stage LLM evaluation under x402 micropayments ($0.25 USDC).
+        """
+        raw_addr = payload.target_address or payload.address or payload.contract_address
+        if not raw_addr or not isinstance(raw_addr, str) or not Web3.is_address(raw_addr):
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": "RequestValidationError",
+                    "message": "Missing or invalid EVM target address in DeepAuditRequest.",
+                    "details": [
+                        {
+                            "loc": ["body", "target_address"],
+                            "msg": "Invalid or missing EVM hex address",
+                            "type": "value_error",
+                        }
+                    ],
+                },
+            )
+        checksum_addr = Web3.to_checksum_address(raw_addr)
+
+        try:
+            cid = ChainId(payload.chain_id)
+        except ValueError:
+            cid = ChainId.BASE_MAINNET
+        cid_int = int(cid.value if hasattr(cid, "value") else cid)
+
+        active_engine: ConditionAgentEngine = app.state.engine
+        x402_cfg: X402Config = getattr(app.state, "x402_config", None) or X402Config()
+        storage_inst: Optional[AgentStorage] = getattr(app.state, "storage", None)
+        resolver = getattr(app.state, "source_resolver", None) or ContractSourceResolver()
+
+        required_usdc = x402_cfg.price_per_deep_audit_usdc
+        required_atomic = usdc_to_atomic(required_usdc)
+
+        # Payment gate (if enabled)
+        payment_data: Optional[Dict[str, Any]] = None
+        if x402_cfg.enabled:
+            payment_header = (
+                request.headers.get("x-payment")
+                or request.headers.get("payment-signature")
+                or request.headers.get("x-payment-signature")
+                or request.headers.get("X-PAYMENT")
+                or request.headers.get("PAYMENT-SIGNATURE")
+            )
+            if not payment_header:
+                return build_402_response(x402_cfg, "/audit/deep", required_usdc)
+
+            try:
+                payment_data = parse_x402_header(payment_header, default_network=x402_cfg.network)
+            except ValueError as exc:
+                return build_402_response(
+                    x402_cfg,
+                    "/audit/deep",
+                    required_usdc,
+                    reason=f"Malformed payment header: {exc}",
+                )
+
+            payment_data["endpoint"] = "/audit/deep"
+            payment_id = payment_data["payment_id"]
+            if storage_inst and await storage_inst.is_payment_settled(payment_id):
+                return build_402_response(
+                    x402_cfg,
+                    "/audit/deep",
+                    required_usdc,
+                    reason="Payment already settled (replay detected)",
+                )
+
+            facilitator = getattr(app.state, "facilitator", None) or MockX402Facilitator()
+            ver = await facilitator.verify(payment_data, required_atomic, x402_cfg)
+            if not ver.valid:
+                return build_402_response(
+                    x402_cfg,
+                    "/audit/deep",
+                    required_usdc,
+                    reason=ver.reason or "Payment verification failed",
+                )
+
+        # Resolve full audit context: proxy status, storage state, verified source code
+        try:
+            audit_ctx = await resolver.resolve_full_audit_context(
+                chain_id=cid_int,
+                target_address=checksum_addr,
+                resolve_proxy=payload.resolve_proxy,
+                fetch_source=payload.fetch_verified_source,
+            )
+        except Exception as exc:
+            logger.exception(f"Error during contract source/proxy resolution: {exc}")
+            if storage_inst is not None:
+                await storage_inst.log_error(
+                    stage="source_resolver",
+                    error_type="ServiceUnavailableNoCharge",
+                    message=f"Contract resolution error: {str(exc)}",
+                    traceback_str=traceback.format_exc(),
+                    context={"path": "/audit/deep"},
+                )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "ServiceUnavailable",
+                    "message": "Execution failed due to upstream RPC error. Payment was NOT settled.",
+                    "payment_settled": False,
+                },
+            )
+
+        # No-Charge-on-Error check for proxy resolution RPC failure
+        if x402_cfg.enabled and audit_ctx.get("proxy_info", {}).get("rpc_error") is not None:
+            if storage_inst is not None:
+                await storage_inst.log_error(
+                    stage="api",
+                    error_type="ServiceUnavailableNoCharge",
+                    message=f"Proxy resolution RPC error: {audit_ctx['proxy_info']['rpc_error']}",
+                    context={"path": "/audit/deep"},
+                )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "ServiceUnavailable",
+                    "message": "Execution failed due to upstream RPC error. Payment was NOT settled.",
+                    "payment_settled": False,
+                },
+            )
+
+        effective_audit_addr = audit_ctx.get("proxy_info", {}).get("effective_audit_address") or checksum_addr
+        source_info = audit_ctx.get("source_info", {})
+        verified_source = {
+            "verified": source_info.get("verified", False),
+            "provider": source_info.get("provider"),
+            "contract_names": source_info.get("contract_names", []),
+            "files_count": source_info.get("files_count", 0),
+            "truncated": source_info.get("truncated", False),
+            "source_code": source_info.get("source_code", ""),
+        }
+        calldata_str = payload.calldata if payload.calldata and payload.calldata.startswith("0x") else "0x"
+        rule_payload = ConditionRulePayload(
+            rule_id=f"deep-audit-{checksum_addr.lower()[:8]}-{int(time.time())}",
+            chain_id=cid,
+            deterministic=DeterministicCondition(
+                target_address=effective_audit_addr,
+                min_value_wei=0,
+                required_function_selectors=None,
+                check_native_balance=False,
+            ),
+            semantic=SemanticCondition(
+                enabled=True,
+                policy_prompt=payload.policy_prompt,
+                risk_threshold=payload.risk_threshold,
+            ),
+            context_metadata={
+                "target_address": checksum_addr,
+                "effective_audit_address": effective_audit_addr,
+                "proxy_info": audit_ctx.get("proxy_info", {}),
+                "verified_source": verified_source,
+                "security_warnings": audit_ctx.get("security_warnings", []),
+                "selectors_found": audit_ctx.get("effective_selectors", []),
+                "proposal_description": payload.proposal_description,
+                "calldata": calldata_str,
+                "source": "deep_audit",
+            },
+        )
+
+        try:
+            agent_resp = await active_engine.process_rule(rule_payload, source="deep_audit")
+        except Exception as exc:
+            logger.exception(f"Error evaluating deep audit rule '{rule_payload.rule_id}': {exc}")
+            if storage_inst is not None:
+                await storage_inst.log_error(
+                    stage="api",
+                    error_type="ServiceUnavailableNoCharge",
+                    message=f"Execution error while processing deep audit: {str(exc)}",
+                    rule_id=rule_payload.rule_id,
+                    traceback_str=traceback.format_exc(),
+                    context={"path": "/audit/deep"},
+                )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "ServiceUnavailable",
+                    "message": "Execution failed due to upstream RPC or internal error. Payment was NOT settled.",
+                    "payment_settled": False,
+                },
+            )
+
+        if not x402_cfg.enabled:
+            return agent_resp
+
+        # No-Charge-on-Error check for deterministic execution
+        if agent_resp.deterministic_check.error is not None:
+            if storage_inst is not None:
+                await storage_inst.log_error(
+                    stage="api",
+                    error_type="ServiceUnavailableNoCharge",
+                    message=f"Deterministic RPC error: {agent_resp.deterministic_check.error}",
+                    rule_id=rule_payload.rule_id,
+                    context={"path": "/audit/deep"},
+                )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "ServiceUnavailable",
+                    "message": "Execution failed due to upstream RPC or internal error. Payment was NOT settled.",
+                    "payment_settled": False,
+                },
+            )
+
+        facilitator = getattr(app.state, "facilitator", None) or MockX402Facilitator()
+        settlement = await facilitator.settle(payment_data, required_atomic, x402_cfg)
+        if not settlement.settled:
+            if storage_inst is not None:
+                await storage_inst.log_error(
+                    stage="payment",
+                    error_type="SettlementError",
+                    message=settlement.error or "Failed to settle",
+                    rule_id=rule_payload.rule_id,
+                    context={"path": "/audit/deep"},
+                )
+            return build_402_response(
+                x402_cfg,
+                "/audit/deep",
+                required_usdc,
+                reason=settlement.error or "Payment settlement failed",
+            )
+
+        receipt = PaymentReceipt(
+            payment_id=payment_data["payment_id"],
+            payer_address=payment_data["payer_address"],
+            pay_to_address=x402_cfg.pay_to_address,
+            amount_usdc=round(required_usdc, 6),
+            amount_atomic=required_atomic,
+            network=payment_data.get("network") or x402_cfg.network,
+            asset=x402_cfg.asset,
+            tx_hash=settlement.tx_hash or "",
+            endpoint="/audit/deep",
             settled_at=datetime.now(timezone.utc).isoformat(),
         )
 

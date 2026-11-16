@@ -2094,6 +2094,142 @@ class TestQuickAuditAndMCPPaymentGateRegressions:
         assert res.get("status") == "payment_required"
         assert res.get("status_code") == 402
 
+    def test_post_preflight_payment_gate_and_valid_receipt(self, audit_regression_client):
+        """
+        POST /preflight payment gate regression:
+        1. Without payment header -> 402 Payment Required ($0.01 USDC).
+        2. With valid payment header -> 200 OK PreflightVerdict with PaymentReceipt ($0.01 USDC).
+        """
+        import json
+        from eth_account import Account
+        from src.x402_payment import usdc_to_atomic
+        from src.schemas import PreflightVerdict, PaymentReceipt
+
+        client = audit_regression_client["client"]
+        target = "0x4200000000000000000000000000000000000006"
+
+        # 1. Without payment header -> 402
+        unpaid = client.post("/preflight", json={"target_address": target})
+        assert unpaid.status_code == 402
+        assert unpaid.json().get("error") == "PaymentRequired"
+
+        # 2. With valid payment header -> 200 OK
+        payer = Account.create()
+        payment_header = json.dumps({
+            "payment_id": "test-reg-preflight-paid-001",
+            "payer_address": payer.address,
+            "amount_atomic": usdc_to_atomic(0.01),
+            "network": "eip155:8453",
+            "signature": "0xvalidmocksignature1234567890",
+        })
+
+        paid = client.post(
+            "/preflight",
+            json={"target_address": target, "calldata": "0x", "run_simulation": False},
+            headers={"X-PAYMENT": payment_header},
+        )
+        assert paid.status_code == 200
+        data = paid.json()
+        assert data["verdict"] == "ALLOW"
+        assert "payment" in data and data["payment"] is not None
+        receipt = PaymentReceipt.model_validate(data["payment"])
+        assert receipt.payment_id == "test-reg-preflight-paid-001"
+        assert receipt.amount_usdc == 0.01
+        assert receipt.amount_atomic == 10000
+
+    def test_post_deep_audit_payment_gate_and_valid_receipt(self, audit_regression_client):
+        """
+        POST /audit/deep payment gate regression:
+        1. Without payment header -> 402 Payment Required ($0.25 USDC).
+        2. With valid payment header -> 200 OK FinalAgentResponse with PaymentReceipt ($0.25 USDC).
+        """
+        import json
+        from eth_account import Account
+        from src.x402_payment import usdc_to_atomic
+        from src.schemas import PaymentReceipt
+
+        client = audit_regression_client["client"]
+        target = "0x4200000000000000000000000000000000000006"
+        ChainInspector._set_bytecode_cache(f"8453:{target}", bytes.fromhex("60806040528063a9059cbb14"))
+
+        # 1. Without payment header -> 402
+        unpaid = client.post("/audit/deep", json={"target_address": target})
+        assert unpaid.status_code == 402
+        assert unpaid.json().get("error") == "PaymentRequired"
+
+        # 2. With valid payment header -> 200 OK
+        payer = Account.create()
+        payment_header = json.dumps({
+            "payment_id": "test-reg-deep-audit-paid-001",
+            "payer_address": payer.address,
+            "amount_atomic": usdc_to_atomic(0.25),
+            "network": "eip155:8453",
+            "signature": "0xvalidmocksignature1234567890",
+        })
+
+        mock_audit_ctx = {
+            "target_address": target,
+            "chain_id": 8453,
+            "effective_audit_address": target,
+            "proxy_info": {"is_proxy": False, "effective_audit_address": target, "rpc_error": None},
+            "source_info": {"verified": False},
+            "effective_selectors": [],
+            "security_warnings": ["Unverified contract source code"],
+        }
+
+        with patch("src.source_resolver.ContractSourceResolver.resolve_full_audit_context", AsyncMock(return_value=mock_audit_ctx)):
+            paid = client.post(
+                "/audit/deep",
+                json={"target_address": target, "proposal_description": "Regression test deep audit"},
+                headers={"X-PAYMENT": payment_header},
+            )
+        assert paid.status_code == 200
+        data = paid.json()
+        assert data["rule_id"].startswith("deep-audit-")
+        assert "payment" in data and data["payment"] is not None
+        receipt = PaymentReceipt.model_validate(data["payment"])
+        assert receipt.payment_id == "test-reg-deep-audit-paid-001"
+        assert receipt.amount_usdc == 0.25
+        assert receipt.amount_atomic == 250000
+
+    def test_preflight_no_charge_on_simulation_rpc_error(self, audit_regression_client):
+        """
+        POST /preflight No-Charge-on-Error regression:
+        When simulation encounters upstream RPC error, returns HTTP 503 and settle is NOT called.
+        """
+        import json
+        from eth_account import Account
+        from src.x402_payment import usdc_to_atomic
+
+        client = audit_regression_client["client"]
+        facilitator = audit_regression_client["facilitator"]
+        settle_calls_before = facilitator.settle_calls
+
+        payer = Account.create()
+        payment_header = json.dumps({
+            "payment_id": "test-reg-preflight-nocharge-001",
+            "payer_address": payer.address,
+            "amount_atomic": usdc_to_atomic(0.01),
+            "network": "eip155:8453",
+            "signature": "0xvalidmocksignature1234567890",
+        })
+
+        mock_w3 = MagicMock()
+        mock_w3.eth = MagicMock()
+        mock_w3.eth.call = AsyncMock(side_effect=Exception("HTTP 502 Bad Gateway node error"))
+
+        with patch("src.chain_inspector.ChainInspector._get_or_create_w3", return_value=mock_w3):
+            resp = client.post(
+                "/preflight",
+                json={"target_address": "0x4200000000000000000000000000000000000006", "run_simulation": True},
+                headers={"X-PAYMENT": payment_header},
+            )
+
+        assert resp.status_code == 503
+        assert resp.json().get("payment_settled") is False
+        assert facilitator.settle_calls == settle_calls_before
+
+
 
 
 
