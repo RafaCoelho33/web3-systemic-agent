@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import sys
+import time
 from typing import Dict, Any, Optional, List, Tuple, Union
 
 import httpx
@@ -273,10 +274,41 @@ class ContractSourceResolver:
         rpc_url: Optional[Union[str, List[str]]] = None,
         http_client: Optional[httpx.AsyncClient] = None,
         timeout: float = 8.0,
+        source_cache_ttl_seconds: float = 3600.0,
+        source_cache_max_entries: int = 512,
     ):
         self.rpc_url = rpc_url
         self.http_client = http_client
         self.timeout = timeout
+        self.source_cache_ttl_seconds = source_cache_ttl_seconds
+        self.source_cache_max_entries = source_cache_max_entries
+        self._source_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+    @staticmethod
+    def _copy_source_result(result: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a shallow copy of a source result dict with a copied contract_names list."""
+        copied = dict(result)
+        if "contract_names" in copied and isinstance(copied["contract_names"], list):
+            copied["contract_names"] = list(copied["contract_names"])
+        return copied
+
+    def _store_source_cache(self, cache_key: str, result: Dict[str, Any]) -> None:
+        """Cache a verified source result using bounded FIFO eviction."""
+        if (
+            result.get("verified") is True
+            and self.source_cache_ttl_seconds > 0
+            and self.source_cache_max_entries > 0
+        ):
+            while (
+                len(self._source_cache) >= self.source_cache_max_entries
+                and cache_key not in self._source_cache
+            ):
+                oldest_key = next(iter(self._source_cache))
+                self._source_cache.pop(oldest_key, None)
+            self._source_cache[cache_key] = (
+                time.monotonic(),
+                self._copy_source_result(result),
+            )
 
     async def _get_request(
         self, url: str, params: Optional[Dict[str, Any]] = None
@@ -460,6 +492,18 @@ class ContractSourceResolver:
         fallback to Etherscan v2 API when API keys are configured.
         """
         checksum_addr = Web3.to_checksum_address(address)
+        cache_key = f"{chain_id}:{checksum_addr.lower()}"
+
+        cached_entry = self._source_cache.get(cache_key)
+        if cached_entry is not None:
+            cached_ts, cached_result = cached_entry
+            if (
+                self.source_cache_ttl_seconds > 0
+                and (time.monotonic() - cached_ts) < self.source_cache_ttl_seconds
+            ):
+                logger.debug("Source cache hit for %s", cache_key)
+                return self._copy_source_result(cached_result)
+            self._source_cache.pop(cache_key, None)
 
         # ---------------------------------------------------------
         # Step 1: Sourcify API (Free, zero API key required)
@@ -495,7 +539,7 @@ class ContractSourceResolver:
                         sol_files, MAX_SOURCE_CHARS
                     )
 
-                    return {
+                    result = {
                         "verified": True,
                         "provider": "sourcify",
                         "match_status": data.get("status", "full") if isinstance(data, dict) else "full",
@@ -505,6 +549,8 @@ class ContractSourceResolver:
                         "source_code": combined_source,
                         "truncated": truncated,
                     }
+                    self._store_source_cache(cache_key, result)
+                    return result
             except Exception as exc:
                 logger.debug(f"Failed to parse Sourcify response for {checksum_addr}: {exc}")
 
@@ -575,7 +621,7 @@ class ContractSourceResolver:
                                             sol_files, MAX_SOURCE_CHARS
                                         )
 
-                                        return {
+                                        result = {
                                             "verified": True,
                                             "provider": "etherscan_v2",
                                             "match_status": "full",
@@ -585,6 +631,8 @@ class ContractSourceResolver:
                                             "source_code": combined_source,
                                             "truncated": truncated,
                                         }
+                                        self._store_source_cache(cache_key, result)
+                                        return result
 
                                 # Single-file raw Solidity source
                                 contract_names = [contract_name] if contract_name else []
@@ -606,7 +654,7 @@ class ContractSourceResolver:
                                 else:
                                     combined_source = raw_source
 
-                                return {
+                                result = {
                                     "verified": True,
                                     "provider": "etherscan_v2",
                                     "match_status": "full",
@@ -616,6 +664,8 @@ class ContractSourceResolver:
                                     "source_code": combined_source,
                                     "truncated": truncated,
                                 }
+                                self._store_source_cache(cache_key, result)
+                                return result
                 except Exception as exc:
                     logger.debug(f"Failed to parse Etherscan response for {checksum_addr}: {exc}")
 

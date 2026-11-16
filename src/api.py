@@ -166,6 +166,31 @@ if not hasattr(X402Config, "price_atomic"):
 
 logger = logging.getLogger(__name__)
 
+
+def _log_mcp_telemetry(msg: Any) -> None:
+    """Emit a 1-line structured telemetry log for incoming MCP JSON-RPC requests."""
+    if not isinstance(msg, dict):
+        return
+    method = msg.get("method", "unknown")
+    if method == "tools/call":
+        params = msg.get("params")
+        tool_name = params.get("name", "unknown") if isinstance(params, dict) else "unknown"
+        logger.info("TELEMETRY | event=mcp_tool_call method=tools/call tool=%s", tool_name)
+    else:
+        logger.info("TELEMETRY | event=mcp_rpc method=%s", method)
+
+
+def _log_x402_settled(endpoint: str, amount_usdc: float, tx_hash: Optional[str], network: str) -> None:
+    """Emit a 1-line structured telemetry log when an x402 payment settles."""
+    logger.info(
+        "TELEMETRY | event=x402_settled endpoint=%s amount_usdc=%s network=%s tx_hash=%s",
+        endpoint,
+        round(amount_usdc, 6),
+        network,
+        tx_hash or "none",
+    )
+
+
 DEFAULT_BATCH_MAX_ITEMS = 50
 
 
@@ -1064,11 +1089,13 @@ def create_app(
         if isinstance(body, list):
             responses = []
             for item in body:
+                _log_mcp_telemetry(item)
                 resp = await mcp.handle_jsonrpc(item)
                 if resp is not None:
                     responses.append(resp)
             return JSONResponse(status_code=status.HTTP_200_OK, content=responses)
 
+        _log_mcp_telemetry(body)
         rpc_resp = await mcp.handle_jsonrpc(body)
         if rpc_resp is None:
             return Response(status_code=status.HTTP_202_ACCEPTED)
@@ -1615,6 +1642,13 @@ def create_app(
                 reason=settlement.error or "Payment settlement failed",
             )
 
+        _log_x402_settled(
+            request.url.path,
+            required_usdc,
+            settlement.tx_hash,
+            payment_data.get("network") or x402_cfg.network,
+        )
+
         receipt = PaymentReceipt(
             payment_id=payment_data["payment_id"],
             payer_address=payment_data["payer_address"],
@@ -1858,6 +1892,13 @@ def create_app(
                 reason=settlement.error or "Payment settlement failed",
             )
 
+        _log_x402_settled(
+            request.url.path,
+            required_usdc,
+            settlement.tx_hash,
+            payment_data.get("network") or x402_cfg.network,
+        )
+
         receipt = PaymentReceipt(
             payment_id=payment_data["payment_id"],
             payer_address=payment_data["payer_address"],
@@ -2022,6 +2063,13 @@ def create_app(
                 required_usdc,
                 reason=settlement.error or "Payment settlement failed",
             )
+
+        _log_x402_settled(
+            "/preflight",
+            required_usdc,
+            settlement.tx_hash,
+            payment_data.get("network") or x402_cfg.network,
+        )
 
         receipt = PaymentReceipt(
             payment_id=payment_data["payment_id"],
@@ -2296,6 +2344,13 @@ def create_app(
                 reason=settlement.error or "Payment settlement failed",
             )
 
+        _log_x402_settled(
+            "/audit/deep",
+            required_usdc,
+            settlement.tx_hash,
+            payment_data.get("network") or x402_cfg.network,
+        )
+
         receipt = PaymentReceipt(
             payment_id=payment_data["payment_id"],
             payer_address=payment_data["payer_address"],
@@ -2480,6 +2535,13 @@ def create_app(
                 reason=settlement.error or "Payment settlement failed",
             )
 
+        _log_x402_settled(
+            request.url.path,
+            required_usdc,
+            settlement.tx_hash,
+            payment_data.get("network") or x402_cfg.network,
+        )
+
         receipt = PaymentReceipt(
             payment_id=payment_data["payment_id"],
             payer_address=payment_data["payer_address"],
@@ -2615,6 +2677,13 @@ def create_app(
                 required_usdc,
                 reason=settlement.error or "Payment settlement failed",
             )
+
+        _log_x402_settled(
+            request.url.path,
+            required_usdc,
+            settlement.tx_hash,
+            payment_data.get("network") or x402_cfg.network,
+        )
 
         receipt = PaymentReceipt(
             payment_id=payment_data["payment_id"],
@@ -2839,6 +2908,13 @@ def create_app(
                 required_usdc,
                 reason=settlement.error or "Payment settlement failed",
             )
+
+        _log_x402_settled(
+            request.url.path,
+            required_usdc,
+            settlement.tx_hash,
+            payment_data.get("network") or x402_cfg.network,
+        )
 
         receipt = PaymentReceipt(
             payment_id=payment_data["payment_id"],

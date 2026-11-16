@@ -1398,6 +1398,13 @@ def build_402_response(
         "X-PAYMENT-REQUIRED": "true",
         "Payment-Required": b64_payment_required,
     }
+    logger.info(
+        "TELEMETRY | event=x402_probe endpoint=%s amount_usdc=%s network=%s reason=%r",
+        endpoint,
+        round(required_usdc, 6),
+        config.network,
+        reason,
+    )
     return JSONResponse(
         status_code=402,
         content=body,
