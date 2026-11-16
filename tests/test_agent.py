@@ -1961,4 +1961,139 @@ class TestGemini429QuotaFailoverAndCooldown:
         assert res.recommended_action == "MANUAL_REVIEW"
 
 
+# =========================================================================
+# Regression Suite: QuickAudit & MCP Payment Gate Hardening
+# =========================================================================
+
+class TestQuickAuditAndMCPPaymentGateRegressions:
+    """
+    Focused regression test class verifying:
+    1. GET /.well-known/x402 returns 200 OK with /evaluate and /audit resources.
+    2. POST /audit without payment header returns 402 when x402 is enabled,
+       and 200 OK with PaymentReceipt when a valid payment header is supplied.
+    3. Web3SystemicMCPServer.deep_semantic_audit with x402_payment_header="fake"
+       returns status == "payment_required" (status_code == 402).
+    """
+
+    @pytest.fixture
+    def audit_regression_client(self, tmp_path):
+        import json
+        from pathlib import Path
+        from src.storage import AgentStorage
+        from src.x402_payment import X402Config, MockX402Facilitator
+        from src.mcp_server import Web3SystemicMCPServer
+
+        db_file = str(tmp_path / "quick_audit_regression.db")
+        storage = AgentStorage(db_path=db_file)
+        evaluator = MockSemanticEvaluator()
+        engine = ConditionAgentEngine(semantic_evaluator=evaluator, storage=storage)
+        cfg = X402Config(enabled=True, price_per_eval_usdc=0.05, network="eip155:8453")
+        facilitator = MockX402Facilitator()
+
+        app = create_app(
+            engine=engine,
+            storage=storage,
+            x402_config=cfg,
+            facilitator=facilitator,
+            public_evaluate_only=True,
+            enable_background_scanner=False,
+        )
+        return {
+            "client": TestClient(app),
+            "storage": storage,
+            "engine": engine,
+            "cfg": cfg,
+            "facilitator": facilitator,
+        }
+
+    def test_well_known_x402_returns_evaluate_and_audit(self, audit_regression_client):
+        """GET /.well-known/x402 returns 200 OK with /evaluate and /audit resources."""
+        client = audit_regression_client["client"]
+        resp = client.get("/.well-known/x402")
+        assert resp.status_code == 200
+
+        data = resp.json()
+        assert data.get("x402Version") == 2
+        assert "resources" in data
+        endpoints = [r["endpoint"] for r in data["resources"]]
+        assert "/evaluate" in endpoints
+        assert "/audit" in endpoints
+
+    def test_post_audit_payment_gate_and_valid_receipt(self, audit_regression_client):
+        """
+        POST /audit without payment header returns 402 when x402 is enabled,
+        and returns 200 OK with PaymentReceipt when a valid payment header is supplied.
+        """
+        import json
+        from eth_account import Account
+        from src.x402_payment import usdc_to_atomic
+        from src.schemas import PaymentReceipt
+
+        client = audit_regression_client["client"]
+        target = "0x4200000000000000000000000000000000000006"
+        ChainInspector._set_bytecode_cache(f"8453:{target}", bytes.fromhex("60806040528063a9059cbb14"))
+
+        # 1. Without payment header -> 402 Payment Required
+        unpaid_resp = client.post(
+            "/audit",
+            json={"target_address": target, "proposal_description": "Probe audit without payment"},
+        )
+        assert unpaid_resp.status_code == 402
+        assert unpaid_resp.json().get("error") == "PaymentRequired"
+
+        # 2. With valid payment header -> 200 OK with PaymentReceipt
+        payer_acc = Account.create()
+        payment_header = json.dumps({
+            "payment_id": "test-agent-audit-paid-001",
+            "payer_address": payer_acc.address,
+            "amount_atomic": usdc_to_atomic(0.05),
+            "network": "eip155:8453",
+            "signature": "0xvalidmocksignature1234567890",
+        })
+
+        paid_resp = client.post(
+            "/audit",
+            json={
+                "target_address": target,
+                "chain_id": 8453,
+                "proposal_description": "Audit sequencer oracle parameter update",
+                "calldata": "0xa9059cbb0000000000000000000000001111111111111111111111111111111111111111",
+            },
+            headers={"X-PAYMENT": payment_header},
+        )
+        assert paid_resp.status_code == 200
+        data = paid_resp.json()
+        assert "payment" in data and data["payment"] is not None
+        receipt = PaymentReceipt.model_validate(data["payment"])
+        assert receipt.payment_id == "test-agent-audit-paid-001"
+        assert receipt.amount_usdc == 0.05
+        assert receipt.amount_atomic == 50000
+        assert data["deterministic_check"]["passed"] is True
+
+    @pytest.mark.asyncio
+    async def test_mcp_deep_semantic_audit_rejects_fake_header(self, audit_regression_client):
+        """
+        Web3SystemicMCPServer.deep_semantic_audit with x402_payment_header="fake"
+        returns status == "payment_required" (status_code == 402).
+        """
+        from src.mcp_server import Web3SystemicMCPServer
+
+        server = Web3SystemicMCPServer(
+            engine=audit_regression_client["engine"],
+            x402_config=audit_regression_client["cfg"],
+            facilitator=audit_regression_client["facilitator"],
+            storage=audit_regression_client["storage"],
+            require_x402_for_deep_audit=True,
+        )
+
+        res = await server.deep_semantic_audit(
+            target_address="0x4200000000000000000000000000000000000006",
+            proposal_description="Test fake header rejection in deep_semantic_audit",
+            x402_payment_header="fake",
+        )
+        assert res.get("status") == "payment_required"
+        assert res.get("status_code") == 402
+
+
+
 

@@ -15,6 +15,7 @@ Usage:
         get_network_profile,
         parse_x402_header,
         create_eip3009_payment_header,
+        QuickAuditRequest,
         build_402_response,
         build_bazaar_discovery_extension,
         CDPFacilitatorAuthProvider,
@@ -422,31 +423,61 @@ class CDPFacilitatorAuthProvider:
         }
 
 
+class QuickAuditRequest(BaseModel):
+    """Simplified payload schema for automated agent queries to /audit."""
+    target_address: Optional[str] = Field(default=None, description="Hex EVM smart contract address to audit")
+    address: Optional[str] = Field(default=None, description="Alias for target_address")
+    contract_address: Optional[str] = Field(default=None, description="Alias for target_address")
+    chain_id: int = Field(default=8453, description="EVM Chain ID (8453 Base Mainnet, 84532 Base Sepolia, 42161 Arbitrum One)")
+    proposal_description: str = Field(
+        default="Audit smart contract for administrative backdoors, honeypot traps, or unauthorized privilege escalation.",
+        description="Natural language intent or audit context",
+    )
+    policy_prompt: str = Field(
+        default="Audit contract and calldata for unauthorized privilege escalation, proxy upgrades, honeypot traps, or treasury drainage.",
+        description="Security policy prompt",
+    )
+    calldata: str = Field(default="0x", description="Optional transaction hex calldata")
+    risk_threshold: float = Field(default=7.0, ge=0.0, le=10.0, description="Risk score threshold")
+
+
 def build_bazaar_discovery_extension(endpoint: str = "/evaluate") -> Dict[str, Any]:
     """
     Constructs an x402 Bazaar auto-discovery extension declaring input/output JSON schemas
     and sample payloads for Agent-to-Agent discovery.
     """
-    sample_input = {
-        "rule_id": "example-audit-01",
-        "chain_id": 8453,
-        "deterministic": {
+    clean_endpoint = str(endpoint or "/evaluate").rstrip("/")
+    if clean_endpoint.endswith("/audit"):
+        sample_input = {
             "target_address": "0x4200000000000000000000000000000000000006",
-            "min_value_wei": 0,
-            "required_function_selectors": ["0xf2fde38b"],
-            "check_native_balance": False,
-        },
-        "semantic": {
-            "enabled": True,
-            "policy_prompt": "Audit transaction calldata and governance proposal for security risks",
-            "risk_threshold": 7.0,
-        },
-        "context_metadata": {
-            "calldata": "0xf2fde38b000000000000000000000000deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-            "proposal_description": "DAO Governance yield optimization parameter update",
-            "tx_value_wei": 0,
-        },
-    }
+            "chain_id": 8453,
+            "proposal_description": "Audit smart contract for administrative backdoors, honeypot traps, or unauthorized privilege escalation.",
+            "calldata": "0x",
+        }
+        input_schema = QuickAuditRequest.model_json_schema()
+    else:
+        sample_input = {
+            "rule_id": "example-audit-01",
+            "chain_id": 8453,
+            "deterministic": {
+                "target_address": "0x4200000000000000000000000000000000000006",
+                "min_value_wei": 0,
+                "required_function_selectors": ["0xf2fde38b"],
+                "check_native_balance": False,
+            },
+            "semantic": {
+                "enabled": True,
+                "policy_prompt": "Audit transaction calldata and governance proposal for security risks",
+                "risk_threshold": 7.0,
+            },
+            "context_metadata": {
+                "calldata": "0xf2fde38b000000000000000000000000deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                "proposal_description": "DAO Governance yield optimization parameter update",
+                "tx_value_wei": 0,
+            },
+        }
+        input_schema = ConditionRulePayload.model_json_schema()
+
     sample_output_example = {
         "rule_id": "example-audit-01",
         "chain_id": 8453,
@@ -457,7 +488,7 @@ def build_bazaar_discovery_extension(endpoint: str = "/evaluate") -> Dict[str, A
         try:
             res = declare_discovery_extension(
                 input=sample_input,
-                input_schema=ConditionRulePayload.model_json_schema(),
+                input_schema=input_schema,
                 body_type="json",
                 output=OutputConfig(
                     example=sample_output_example,
@@ -488,7 +519,7 @@ def build_bazaar_discovery_extension(endpoint: str = "/evaluate") -> Dict[str, A
                 },
             },
             "schema": {
-                "input": ConditionRulePayload.model_json_schema(),
+                "input": input_schema,
                 "output": FinalAgentResponse.model_json_schema(),
             },
         }
@@ -852,6 +883,34 @@ class HTTPX402Facilitator:
                 amount_usdc=amount_usdc,
             )
 
+    def _build_resource_and_extensions(
+        self, payment_data: Dict[str, Any]
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        endpoint = str(payment_data.get("endpoint") or "/evaluate")
+        full_resource_url = (
+            endpoint
+            if endpoint.startswith("http://") or endpoint.startswith("https://")
+            else f"https://web3-systemic-agent.onrender.com{endpoint if endpoint.startswith('/') else '/' + endpoint}"
+        )
+        default_resource_obj = {
+            "url": full_resource_url,
+            "description": f"Web3 Security & Governance Audit for {endpoint} — EVM Pre-Transaction Security Firewall, Calldata Decoder & DAO Proposal Risk Auditor (Base, Ethereum, Arbitrum, Optimism)",
+            "mimeType": "application/json",
+            "serviceName": "Web3 Systemic Agent",
+            "tags": ["web3-security", "smart-contract-audit", "honeypot-detector", "dao-governance", "base", "evm"],
+        }
+        if isinstance(payment_data.get("resource"), dict) and payment_data["resource"].get("url"):
+            resource_obj = payment_data["resource"]
+        else:
+            resource_obj = default_resource_obj
+
+        if isinstance(payment_data.get("extensions"), dict) and "bazaar" in payment_data["extensions"]:
+            extensions_dict = payment_data["extensions"]
+        else:
+            extensions_dict = build_bazaar_discovery_extension(endpoint)
+
+        return resource_obj, extensions_dict
+
     def _settle_eip3009_sync(
         self,
         payload_obj: Any,
@@ -859,6 +918,7 @@ class HTTPX402Facilitator:
         facilitator_url: str,
         network: str,
         auth_provider: Any = None,
+        declared_extensions: Optional[Dict[str, Any]] = None,
     ) -> SettlementResult:
         try:
             fac_cfg = FacilitatorConfig(url=facilitator_url, auth_provider=auth_provider) if auth_provider else FacilitatorConfig(url=facilitator_url)
@@ -872,7 +932,10 @@ class HTTPX402Facilitator:
                     logger.debug("Could not register bazaar extension on srv: %s", ext_err)
             srv.initialize()
 
-            s = srv.settle_payment(payload_obj, req)
+            try:
+                s = srv.settle_payment(payload_obj, req, declared_extensions=declared_extensions)
+            except TypeError:
+                s = srv.settle_payment(payload_obj, req)
             settle_success = getattr(s, "success", False)
             if not settle_success and hasattr(s, "settle"):
                 settle_success = getattr(s.settle, "success", False)
@@ -909,6 +972,7 @@ class HTTPX402Facilitator:
         payer_address = str(payment_data.get("payer_address", ""))
         amount_atomic = int(payment_data.get("amount_atomic", 0))
         amount_usdc = float(payment_data.get("amount_usdc", amount_atomic / (10 ** USDC_DECIMALS)))
+        resource_obj, extensions_dict = self._build_resource_and_extensions(payment_data)
 
         is_eip3009 = (
             self.client is None
@@ -958,6 +1022,8 @@ class HTTPX402Facilitator:
             payload_dict = {
                 "x402Version": payment_data.get("x402Version", 2),
                 "payload": payment_data["payload"],
+                "resource": resource_obj,
+                "extensions": extensions_dict,
             }
             if isinstance(accepted_data, dict):
                 payload_dict["accepted"] = accepted_data
@@ -1007,6 +1073,8 @@ class HTTPX402Facilitator:
                 "signature": payment_data.get("signature", ""),
             },
             "accepted": req_dict,
+            "resource": resource_obj,
+            "extensions": extensions_dict,
         }
 
         payload = {
@@ -1066,6 +1134,8 @@ class HTTPX402Facilitator:
         required_atomic: int,
         config: X402Config,
     ) -> SettlementResult:
+        resource_obj, extensions_dict = self._build_resource_and_extensions(payment_data)
+
         is_eip3009 = (
             self.client is None
             and HAS_X402_SDK
@@ -1094,6 +1164,8 @@ class HTTPX402Facilitator:
             payload_dict = {
                 "x402Version": payment_data.get("x402Version", 2),
                 "payload": payment_data["payload"],
+                "resource": resource_obj,
+                "extensions": extensions_dict,
             }
             if isinstance(accepted_data, dict):
                 payload_dict["accepted"] = accepted_data
@@ -1115,6 +1187,7 @@ class HTTPX402Facilitator:
                 facilitator_url=base_url,
                 network=config.network,
                 auth_provider=auth_provider,
+                declared_extensions=extensions_dict,
             )
 
         base_url = (self.facilitator_url or config.facilitator_url).rstrip("/")
@@ -1140,6 +1213,8 @@ class HTTPX402Facilitator:
                 "signature": payment_data.get("signature", ""),
             },
             "accepted": req_dict,
+            "resource": resource_obj,
+            "extensions": extensions_dict,
         }
 
         payload = {
@@ -1220,6 +1295,8 @@ def build_402_response(
         "url": full_resource_url,
         "description": f"Web3 Security & Governance Audit for {endpoint} — EVM Pre-Transaction Security Firewall, Calldata Decoder & DAO Proposal Risk Auditor (Base, Ethereum, Arbitrum, Optimism)",
         "mimeType": "application/json",
+        "serviceName": "Web3 Systemic Agent",
+        "tags": ["web3-security", "smart-contract-audit", "honeypot-detector", "dao-governance", "base", "evm"],
     }
     body = {
         "x402Version": 2,

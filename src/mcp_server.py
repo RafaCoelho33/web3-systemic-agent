@@ -24,8 +24,10 @@ import logging
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List, Union
 
+from eth_account import Account
 from web3 import Web3
 
 # Ensure module search paths support running directly or as a package
@@ -44,12 +46,21 @@ try:
         DeterministicCondition,
         SemanticCondition,
         FinalAgentResponse,
+        PaymentReceipt,
     )
     from src.engine import ConditionAgentEngine
     from src.chain_inspector import ChainInspector
     from src.governance_connector import (
         SnapshotGovernanceConnector,
         get_curated_dao_proposals,
+    )
+    from src.x402_payment import (
+        X402Config,
+        parse_x402_header,
+        create_eip3009_payment_header,
+        get_x402_facilitator,
+        usdc_to_atomic,
+        DEFAULT_PAY_TO_ADDRESS,
     )
     from scripts.block_contract_scanner import (
         extract_selectors_from_bytecode,
@@ -63,12 +74,21 @@ except ImportError:
         DeterministicCondition,
         SemanticCondition,
         FinalAgentResponse,
+        PaymentReceipt,
     )
     from engine import ConditionAgentEngine
     from chain_inspector import ChainInspector
     from governance_connector import (
         SnapshotGovernanceConnector,
         get_curated_dao_proposals,
+    )
+    from x402_payment import (
+        X402Config,
+        parse_x402_header,
+        create_eip3009_payment_header,
+        get_x402_facilitator,
+        usdc_to_atomic,
+        DEFAULT_PAY_TO_ADDRESS,
     )
     from block_contract_scanner import (
         extract_selectors_from_bytecode,
@@ -144,6 +164,9 @@ class Web3SystemicMCPServer:
         agent_url: Optional[str] = None,
         buyer_private_key: Optional[str] = None,
         require_x402_for_deep_audit: bool = True,
+        x402_config: Optional[Any] = None,
+        facilitator: Optional[Any] = None,
+        storage: Optional[Any] = None,
     ):
         self.engine = engine
         self.agent_url = (
@@ -154,6 +177,9 @@ class Web3SystemicMCPServer:
         ).rstrip("/")
         self.buyer_private_key = buyer_private_key or os.getenv("X402_BUYER_PRIVATE_KEY")
         self.require_x402_for_deep_audit = require_x402_for_deep_audit
+        self.x402_config = x402_config
+        self.facilitator = facilitator
+        self.storage = storage
 
     def get_tools_manifest(self) -> List[Dict[str, Any]]:
         """Returns the canonical MCP tools manifest defining all available tools and their schemas."""
@@ -204,10 +230,13 @@ class Web3SystemicMCPServer:
                         "chain_id": {"type": "integer"},
                         "is_contract": {"type": "boolean"},
                         "bytecode_size_bytes": {"type": "integer"},
-                        "selectors_found": {"type": "array", "items": {"type": "string"}},
-                        "high_risk_selectors": {"type": "array", "items": {"type": "object"}},
+                        "selectors_found": {"type": "array", "items": {"type": "object"}},
+                        "high_risk_selectors": {"type": "array", "items": {"type": "string"}},
+                        "high_risk_signatures": {"type": "array", "items": {"type": "string"}},
                         "risk_level": {"type": "string", "enum": ["HIGH", "LOW", "EOA"]},
                         "recommendation": {"type": "string"},
+                        "upsell_recommendation": {"type": ["string", "null"]},
+                        "llm_invoked": {"type": "boolean"},
                     },
                     "required": ["target_address", "is_contract", "selectors_found", "high_risk_selectors", "risk_level"],
                 },
@@ -261,8 +290,11 @@ class Web3SystemicMCPServer:
                         "is_honeypot_suspect": {"type": "boolean"},
                         "risk_score": {"type": "number"},
                         "threat_categories": {"type": "array", "items": {"type": "string"}},
+                        "categories_detected": {"type": "array", "items": {"type": "string"}},
                         "risk_flags": {"type": "array", "items": {"type": "string"}},
                         "recommendation": {"type": "string"},
+                        "upsell_recommendation": {"type": ["string", "null"]},
+                        "llm_invoked": {"type": "boolean"},
                     },
                     "required": ["token_address", "is_honeypot_suspect", "risk_score", "threat_categories", "risk_flags"],
                 },
@@ -314,6 +346,8 @@ class Web3SystemicMCPServer:
                         "proposals_count": {"type": "integer"},
                         "proposals": {"type": "array", "items": {"type": "object"}},
                         "recommendation": {"type": "string"},
+                        "upsell_recommendation": {"type": ["string", "null"]},
+                        "llm_invoked": {"type": "boolean"},
                     },
                     "required": ["space_id", "proposals_count", "proposals"],
                 },
@@ -429,13 +463,17 @@ class Web3SystemicMCPServer:
             upsell = None
 
         return {
+            "tool": "scan_contract_selectors",
+            "stage": 1,
             "target_address": checksum_addr,
             "chain_id": chain_id,
             "is_contract": is_contract,
             "bytecode_size_bytes": bytecode_size,
             "selectors_found": selectors,
+            "high_risk_selectors": high_risk,
             "high_risk_signatures": high_risk,
             "risk_level": risk_level,
+            "recommendation": upsell or "No high-risk administrative selectors detected.",
             "llm_invoked": False,
             "cost_usd": 0.0,
             "upsell_recommendation": upsell,
@@ -453,12 +491,18 @@ class Web3SystemicMCPServer:
 
         if not code_bytes or code_bytes in (b"", b"\x00"):
             return {
+                "tool": "check_token_honeypot",
+                "stage": 1,
                 "token_address": checksum_addr,
                 "chain_id": chain_id,
+                "is_contract": False,
+                "bytecode_size_bytes": 0,
                 "is_honeypot_suspect": False,
                 "risk_score": 0.0,
+                "threat_categories": [],
                 "risk_flags": [],
                 "categories_detected": [],
+                "recommendation": "No static honeypot indicators detected.",
                 "llm_invoked": False,
                 "cost_usd": 0.0,
                 "upsell_recommendation": None,
@@ -482,12 +526,18 @@ class Web3SystemicMCPServer:
         )
 
         return {
+            "tool": "check_token_honeypot",
+            "stage": 1,
             "token_address": checksum_addr,
             "chain_id": chain_id,
+            "is_contract": bool(code_bytes and code_bytes not in (b"", b"\x00")),
+            "bytecode_size_bytes": len(code_bytes) if code_bytes and code_bytes not in (b"", b"\x00") else 0,
             "is_honeypot_suspect": is_honeypot,
             "risk_score": risk_score,
+            "threat_categories": active_cats,
             "risk_flags": analysis.get("honeypot_flags", []),
             "categories_detected": active_cats,
+            "recommendation": upsell or "No static honeypot indicators detected.",
             "llm_invoked": False,
             "cost_usd": 0.0,
             "upsell_recommendation": upsell,
@@ -531,12 +581,48 @@ class Web3SystemicMCPServer:
         ]
 
         return {
+            "tool": "scan_dao_proposals",
+            "stage": 1,
             "space_id": space_id,
             "proposals_count": len(formatted),
             "proposals": formatted,
+            "recommendation": "Use 'deep_semantic_audit' on any proposal with suspicious calldata or target contract.",
             "llm_invoked": False,
             "cost_usd": 0.0,
             "upsell_recommendation": "Use 'deep_semantic_audit' on any proposal with suspicious calldata or target contract.",
+        }
+
+    def _build_mcp_402_dict(
+        self,
+        payload: ConditionRulePayload,
+        reason: Optional[str] = None,
+        cfg: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        net = cfg.network if cfg and getattr(cfg, "network", None) else "eip155:8453"
+        price = (
+            float(cfg.price_per_eval_usdc)
+            if cfg and getattr(cfg, "price_per_eval_usdc", None) is not None
+            else 0.05
+        )
+        pay_to = (
+            cfg.pay_to_address
+            if cfg and getattr(cfg, "pay_to_address", None) and cfg.pay_to_address != DEFAULT_PAY_TO_ADDRESS
+            else os.getenv("PAY_TO_ADDRESS", "0x2b7F1fd931f7f28f89e0f688Dd5Bb7a620c24b63")
+        )
+        return {
+            "tool": "deep_semantic_audit",
+            "stage": 2,
+            "status": "payment_required",
+            "status_code": 402,
+            "protocol": "x402",
+            "network": net,
+            "price_usdc": price,
+            "pay_to_address": pay_to,
+            "evaluate_endpoint": f"{self.agent_url}/evaluate",
+            "message": reason or "Stage 2 Deep Semantic LLM Audit requires a $0.05 USDC x402 micropayment on Base Mainnet.",
+            "reason": reason or "Payment Required",
+            "instructions": "Provide 'x402_payment_header' (Base64 EIP-3009 authorization) or configure X402_BUYER_PRIVATE_KEY in the MCP environment.",
+            "rule_payload": payload.model_dump(mode="json"),
         }
 
     async def deep_semantic_audit(
@@ -592,33 +678,97 @@ class Web3SystemicMCPServer:
             },
         )
 
-        # Payment check: if x402 is required and neither header nor buyer key is present
-        if (
-            self.require_x402_for_deep_audit
-            and not x402_payment_header
-            and not self.buyer_private_key
-        ):
-            return {
-                "status": "payment_required",
-                "status_code": 402,
-                "protocol": "x402",
-                "network": "eip155:8453",
-                "price_usdc": 0.05,
-                "pay_to_address": os.getenv(
-                    "PAY_TO_ADDRESS", "0x2b7F1fd931f7f28f89e0f688Dd5Bb7a620c24b63"
-                ),
-                "evaluate_endpoint": f"{self.agent_url}/evaluate",
-                "message": "Stage 2 Deep Semantic LLM Audit requires a $0.05 USDC x402 micropayment on Base Mainnet.",
-                "instructions": "Provide 'x402_payment_header' (Base64 EIP-3009 authorization) or configure X402_BUYER_PRIVATE_KEY in the MCP environment.",
-                "rule_payload": payload.model_dump(mode="json"),
-            }
+        if self.require_x402_for_deep_audit:
+            if not x402_payment_header and not self.buyer_private_key:
+                return self._build_mcp_402_dict(payload, cfg=self.x402_config)
 
-        if self.engine is None:
-            self.engine = ConditionAgentEngine()
+            cfg = self.x402_config or X402Config(
+                enabled=True,
+                network=os.getenv("X402_NETWORK", "eip155:8453"),
+                price_per_eval_usdc=float(os.getenv("X402_PRICE_EVALUATE", "0.05")),
+                pay_to_address=os.getenv("PAY_TO_ADDRESS", "0x2b7F1fd931f7f28f89e0f688Dd5Bb7a620c24b63"),
+            )
 
-        res = await self.engine.process_rule(payload, source="mcp_server")
+            if not x402_payment_header and self.buyer_private_key:
+                try:
+                    account = Account.from_key(self.buyer_private_key)
+                    req_atomic = usdc_to_atomic(cfg.price_per_eval_usdc)
+                    x402_payment_header = create_eip3009_payment_header(
+                        account=account,
+                        pay_to_address=cfg.pay_to_address,
+                        amount_atomic=req_atomic,
+                        network=cfg.network,
+                        as_base64=True,
+                    )
+                except Exception as exc:
+                    return self._build_mcp_402_dict(payload, reason=f"Invalid buyer private key or signing failure: {exc}", cfg=cfg)
+
+            try:
+                payment_data = parse_x402_header(x402_payment_header, default_network=cfg.network)
+            except ValueError as exc:
+                return self._build_mcp_402_dict(payload, reason=f"Malformed payment header: {exc}", cfg=cfg)
+
+            payment_data["endpoint"] = "/evaluate"
+
+            if self.storage is not None and await self.storage.is_payment_settled(payment_data["payment_id"]):
+                return self._build_mcp_402_dict(payload, reason="Payment already settled (replay detected)", cfg=cfg)
+
+            facilitator = self.facilitator or get_x402_facilitator(cfg)
+            required_atomic = usdc_to_atomic(cfg.price_per_eval_usdc)
+
+            ver = await facilitator.verify(payment_data, required_atomic, cfg)
+            if not ver.valid:
+                return self._build_mcp_402_dict(payload, reason=ver.reason or "Payment verification failed", cfg=cfg)
+
+            if self.engine is None:
+                self.engine = ConditionAgentEngine()
+
+            res = await self.engine.process_rule(payload, source="mcp_server")
+
+            if res.deterministic_check.error is not None:
+                return {
+                    "tool": "deep_semantic_audit",
+                    "stage": 2,
+                    "status": "error",
+                    "status_code": 503,
+                    "payment_settled": False,
+                    "error": res.deterministic_check.error,
+                }
+
+            settlement = await facilitator.settle(payment_data, required_atomic, cfg)
+            if not settlement.settled:
+                return self._build_mcp_402_dict(payload, reason=settlement.error or "Payment settlement failed", cfg=cfg)
+
+            receipt = PaymentReceipt(
+                payment_id=payment_data["payment_id"],
+                payer_address=payment_data["payer_address"],
+                pay_to_address=cfg.pay_to_address,
+                amount_usdc=round(cfg.price_per_eval_usdc, 6),
+                amount_atomic=required_atomic,
+                network=payment_data.get("network") or cfg.network,
+                asset=cfg.asset,
+                tx_hash=settlement.tx_hash or "",
+                endpoint="/evaluate",
+                settled_at=datetime.now(timezone.utc).isoformat(),
+            )
+            res.payment = receipt
+            if self.storage is not None:
+                await self.storage.record_payment(receipt, rule_id=payload.rule_id)
+        else:
+            if self.engine is None:
+                self.engine = ConditionAgentEngine()
+            res = await self.engine.process_rule(payload, source="mcp_server")
+
+        sem = getattr(res, "semantic_Evaluation", None) or getattr(res, "semantic_evaluation", None)
         dumped = res.model_dump(mode="json")
+        dumped["tool"] = "deep_semantic_audit"
+        dumped["stage"] = 2
         dumped["status"] = "completed"
+        dumped["status_code"] = 200
+        dumped["decision"] = sem.recommended_action if sem else ("APPROVE" if res.deterministic_check.passed else "REJECT")
+        dumped["risk_score"] = sem.risk_score if sem else 0.0
+        dumped["reasoning"] = sem.summary if sem else res.deterministic_check.reason
+        dumped["flagged_issues"] = sem.flagged_issues if sem else []
         return dumped
 
     async def handle_jsonrpc(
