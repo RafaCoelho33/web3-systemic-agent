@@ -24,7 +24,8 @@ The service is continuously deployed and operational in production on [Render](h
 
 * **Base URL:** [`https://web3-systemic-agent.onrender.com`](https://web3-systemic-agent.onrender.com)
 * **MCP Discovery / Streamable-HTTP:** [`https://web3-systemic-agent.onrender.com/mcp`](https://web3-systemic-agent.onrender.com/mcp)
-* **Deep Semantic Audit Price:** `0.05 USDC` (EIP-3009 Gasless)
+* **x402 Discovery Metadata:** [`https://web3-systemic-agent.onrender.com/.well-known/x402`](https://web3-systemic-agent.onrender.com/.well-known/x402)
+* **Deep Semantic Audit Price:** `0.015 USDC` (`15000` atomic, EIP-3009 Gasless)
 * **Default Production Network:** Base Mainnet (`eip155:8453`) & Base Sepolia (`eip155:84532`)
 * **Agent Recipient Wallet (`PAY_TO_ADDRESS`):** [`0x2b7F1fd931f7f28f89e0f688Dd5Bb7a620c24b63`](https://basescan.org/address/0x2b7F1fd931f7f28f89e0f688Dd5Bb7a620c24b63)
 
@@ -34,10 +35,12 @@ The service is continuously deployed and operational in production on [Render](h
 | :--- | :--- | :--- | :--- |
 | `GET` | `/` | Service discovery, payment parameters, and endpoint directory | Free |
 | `GET` | `/health` | Uptime probe, multi-chain RPC connectivity, LLM status | Free |
+| `GET` | `/.well-known/x402` | x402 v2 service specification and Bazaar discovery resources | Free |
 | `GET` | `/mcp` | MCP server discovery, transport metadata, tools manifest | Free |
 | `POST` | `/mcp` | MCP JSON-RPC 2.0 execution endpoint (streamable-http) | Free / 402 for Deep Audit |
 | `POST` | `/rules/validate` | Static deterministic rule pre-validation and syntax check | Free |
-| `POST` | `/evaluate` | Two-stage hybrid evaluation (Deterministic + Gemini LLM) | **0.05 USDC** |
+| `GET` / `POST` | `/audit` | Simplified one-shot Smart Contract Audit (`QuickAuditRequest`) | **0.015 USDC** |
+| `GET` / `POST` | `/evaluate` | Two-stage hybrid evaluation (`ConditionRulePayload` + Gemini LLM) | **0.015 USDC** |
 | `POST` | `/rules/evaluate-batch` | Synchronous batch evaluation for up to 50 rules | Free / Sub-rules gated |
 | `POST` | `/rules/enqueue` | Asynchronous evaluation queue returning unique `job_id` | Free |
 | `GET` | `/jobs/{job_id}` | Asynchronous job status inspection and results retrieval | Free |
@@ -227,8 +230,8 @@ async with httpx.AsyncClient() as client:
 
 ```mermaid
 flowchart TD
-    Client["Client / Agent / MCP Tool"] -->|POST /evaluate or deep_semantic_audit| Gate["x402 Payment Gatekeeper\n(EIP-3009 Gasless USDC)"]
-    Gate -->|No / Invalid Payment Header| R402["HTTP 402 Payment Required\n(0.05 USDC -> PAY_TO_ADDRESS)"]
+    Client["Client / Agent / MCP Tool"] -->|POST /audit, /evaluate or deep_semantic_audit| Gate["x402 Payment Gatekeeper\n(EIP-3009 Gasless USDC)"]
+    Gate -->|No / Invalid Payment Header| R402["HTTP 402 Payment Required\n(0.015 USDC -> PAY_TO_ADDRESS)"]
     Gate -->|Valid EIP-3009 Authorization| S1["Stage 1: ChainInspector (AsyncWeb3)\nBytecode Cache + Native Balance + Selectors"]
     S1 -->|Condition Fails| ShortCircuit["Deterministic Short-Circuit\n(llm_invoked=False, LLM Cost = $0.00)"]
     S1 -->|RPC Connectivity Error| Err503["HTTP 503 Unavailable\n(Payment NOT Settled / No Charge)"]
@@ -238,6 +241,16 @@ flowchart TD
     Policy --> Settle
     Settle --> Resp["HTTP 200 OK: FinalAgentResponse + PaymentReceipt"]
 ```
+
+### Proven Live On-Chain Settlements (Base Mainnet)
+
+Real **EIP-3009 (`transferWithAuthorization`)** USDC settlements executed on **Base Mainnet (Chain ID: `8453`)** via the Coinbase CDP x402 Facilitator and indexed in the **x402 Bazaar**:
+
+| Endpoint | Settled Amount | Transaction Hash | Status |
+| :--- | :--- | :--- | :--- |
+| `POST /audit` | `0.015 USDC` | [`0x2ee54ab1bf34...`](https://basescan.org/tx/0x2ee54ab1bf344998c4e5f4ebb9b30fa0a3d96accb1be813beefd0863e3e5ccc0) | `Success` (Gasless EIP-3009) |
+| `POST /evaluate` | `0.015 USDC` | [`0xecc0a97196f7...`](https://basescan.org/tx/0xecc0a97196f7f4a27379e266e10bd652bb4672c278f58376d0bc6cd49f5eb0ff) | `Success` (Gasless EIP-3009) |
+| `POST /audit` | `0.05 USDC` | [`0xbcc7ebd3d956...`](https://basescan.org/tx/0xbcc7ebd3d9561f01ae1e190a35509a7a70163c42115cba5588db35c34e0b0f10) | `Success` (Gasless EIP-3009) |
 
 ### Proven Live On-Chain Settlements (Base Sepolia)
 
@@ -323,7 +336,7 @@ GEMINI_FAILOVER_MODELS=gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-2.5-fl
 PAY_TO_ADDRESS=0x2b7F1fd931f7f28f89e0f688Dd5Bb7a620c24b63
 X402_ENABLED=true
 X402_NETWORK=eip155:8453
-X402_PRICE_EVALUATE=0.05
+X402_PRICE_EVALUATE=0.015
 X402_USE_LIVE_FACILITATOR=true
 ```
 
