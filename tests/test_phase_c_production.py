@@ -583,7 +583,6 @@ class TestPhaseCSecurityHardening:
         restricted_endpoints = [
             ("GET", "/docs"),
             ("GET", "/redoc"),
-            ("GET", "/openapi.json"),
             ("GET", "/metrics/summary"),
             ("GET", "/logs/errors"),
             ("GET", "/payments"),
@@ -597,6 +596,15 @@ class TestPhaseCSecurityHardening:
             assert resp.status_code == 403, f"{endpoint} expected 403, got {resp.status_code}"
             data = resp.json()
             assert data.get("error") == "Forbidden" or "Forbidden" in resp.text
+
+        # Verify /openapi.json returns 200 and is sanitized to public paths only
+        openapi_resp = client.get("/openapi.json")
+        assert openapi_resp.status_code == 200
+        openapi_paths = openapi_resp.json().get("paths", {})
+        for public_path in ["/evaluate", "/audit", "/preflight", "/audit/deep", "/mcp"]:
+            assert public_path in openapi_paths, f"Expected {public_path} in openapi paths"
+        for restricted_path in ["/metrics/summary", "/logs/errors", "/payments", "/governance/audit-proposals"]:
+            assert restricted_path not in openapi_paths, f"Did not expect {restricted_path} in openapi paths"
 
         # 2. Verify GET / returns 200, swagger_docs/docs not exposed, evaluate is exposed
         root_resp = client.get("/")

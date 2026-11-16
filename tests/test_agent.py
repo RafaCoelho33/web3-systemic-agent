@@ -2229,6 +2229,30 @@ class TestQuickAuditAndMCPPaymentGateRegressions:
         assert resp.json().get("payment_settled") is False
         assert facilitator.settle_calls == settle_calls_before
 
+    def test_openapi_json_exposed_and_sanitized_in_public_evaluate_only_mode(self, audit_regression_client):
+        """
+        Verify that when public_evaluate_only=True, GET /openapi.json returns 200 OK
+        with public paths only and GET /docs returns 403 Forbidden.
+        """
+        client = audit_regression_client["client"]
+
+        # GET /docs must be blocked with 403
+        docs_resp = client.get("/docs")
+        assert docs_resp.status_code == 403
+
+        # GET /openapi.json must return 200 OK with sanitized public paths only
+        resp = client.get("/openapi.json")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "paths" in data
+        paths = data["paths"]
+
+        for public_path in ["/evaluate", "/audit", "/preflight", "/audit/deep", "/mcp"]:
+            assert public_path in paths, f"Expected {public_path} in openapi paths"
+
+        for restricted_path in ["/metrics/summary", "/logs/errors", "/payments", "/governance/audit-proposals"]:
+            assert restricted_path not in paths, f"Did not expect {restricted_path} in openapi paths"
+
 
 
 

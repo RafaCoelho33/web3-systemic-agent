@@ -325,6 +325,7 @@ async def _background_scanner_worker(app_instance: FastAPI):
 
 ROBOTS_TXT_CONTENT = """User-agent: *
 Allow: /
+Allow: /openapi.json
 Allow: /mcp
 Allow: /evaluate
 Allow: /audit
@@ -342,6 +343,7 @@ Disallow: /jobs/
 
 User-agent: GPTBot
 Allow: /
+Allow: /openapi.json
 Allow: /mcp
 Allow: /evaluate
 Allow: /audit
@@ -359,6 +361,7 @@ Disallow: /jobs/
 
 User-agent: ClaudeBot
 Allow: /
+Allow: /openapi.json
 Allow: /mcp
 Allow: /evaluate
 Allow: /audit
@@ -376,6 +379,7 @@ Disallow: /jobs/
 
 User-agent: PerplexityBot
 Allow: /
+Allow: /openapi.json
 Allow: /mcp
 Allow: /evaluate
 Allow: /audit
@@ -393,6 +397,7 @@ Disallow: /jobs/
 
 User-agent: Google-Extended
 Allow: /
+Allow: /openapi.json
 Allow: /mcp
 Allow: /evaluate
 Allow: /audit
@@ -673,7 +678,7 @@ def create_app(
         lifespan=lifespan,
         docs_url=None if effective_public_evaluate_only else "/docs",
         redoc_url=None if effective_public_evaluate_only else "/redoc",
-        openapi_url=None if effective_public_evaluate_only else "/openapi.json",
+        openapi_url="/openapi.json",
     )
 
     # Enable CORS for B2B/Micro-SaaS integration
@@ -756,6 +761,7 @@ def create_app(
 
             allowed_paths = {
                 "/",
+                "/openapi.json",
                 "/favicon.ico",
                 "/icon.svg",
                 "/health",
@@ -953,6 +959,7 @@ def create_app(
         x402_cfg: X402Config = getattr(app.state, "x402_config", None) or X402Config()
         if getattr(app.state, "public_evaluate_only", False):
             endpoints = {
+                "openapi": "/openapi.json",
                 "health": "/health",
                 "validate_rule": "/rules/validate",
                 "evaluate": "/evaluate",
@@ -970,6 +977,7 @@ def create_app(
         else:
             endpoints = {
                 "swagger_docs": "/docs",
+                "openapi": "/openapi.json",
                 "health": "/health",
                 "validate_rule": "/rules/validate",
                 "evaluate": "/evaluate",
@@ -2659,7 +2667,7 @@ def create_app(
             "updated_at": job.updated_at,
         }
 
-    @app.get("/metrics/summary", tags=["Monitoring"])
+    @app.get("/metrics/summary", tags=["Monitoring"], include_in_schema=not effective_public_evaluate_only)
     async def get_metrics_summary(target_price: float = 0.01):
         """
         Retrieves aggregated operational, token, cost, and error metrics from the ledger database.
@@ -2674,7 +2682,7 @@ def create_app(
         metrics["background_scanner_active"] = bool(getattr(app.state, "scanner_active", False))
         return metrics
 
-    @app.get("/logs/errors", tags=["Monitoring"])
+    @app.get("/logs/errors", tags=["Monitoring"], include_in_schema=not effective_public_evaluate_only)
     async def get_error_logs(limit: int = 50, stage: Optional[str] = None):
         """
         Retrieves recent operational and execution errors recorded in the ledger database.
@@ -2687,7 +2695,7 @@ def create_app(
             )
         return await storage_inst.get_errors(limit=limit, stage=stage)
 
-    @app.get("/payments", tags=["Payment Diagnostics"])
+    @app.get("/payments", tags=["Payment Diagnostics"], include_in_schema=not effective_public_evaluate_only)
     async def get_payments(limit: int = 50, payer_address: Optional[str] = None):
         """
         Retrieves recent settled payments recorded in the operational ledger.
@@ -2705,6 +2713,7 @@ def create_app(
         response_model=List[GovernanceAuditReport],
         tags=["Governance"],
         summary="Audit recent DAO governance proposals via Snapshot GraphQL or curated dataset",
+        include_in_schema=not effective_public_evaluate_only,
     )
     async def audit_governance_proposals(
         request: Request,
