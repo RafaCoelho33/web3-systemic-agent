@@ -43,7 +43,7 @@ for _p in (_ROOT_DIR, _SRC_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from src.api import _log_mcp_telemetry, create_app
+from src.api import _log_mcp_telemetry, configure_runtime_logging, create_app
 from src.engine import ConditionAgentEngine
 from src.semantic_evaluator import MockSemanticEvaluator
 from src.source_resolver import ContractSourceResolver
@@ -442,3 +442,47 @@ class TestStructuredTelemetryLogging:
         assert payment_header not in caplog.text
         assert secret_sig not in caplog.text
         assert secret_priv_marker not in caplog.text
+
+    def test_configure_runtime_logging_noops_under_pytest(self):
+        src_logger = logging.getLogger("src")
+        orig_handlers = src_logger.handlers[:]
+        orig_level = src_logger.level
+        orig_propagate = src_logger.propagate
+
+        assert configure_runtime_logging() is False
+        assert src_logger.handlers == orig_handlers
+        assert src_logger.level == orig_level
+        assert src_logger.propagate == orig_propagate
+
+    def test_configure_runtime_logging_enables_src_info_without_root_or_httpx(self, capsys):
+        src_logger = logging.getLogger("src")
+        root_logger = logging.getLogger()
+
+        orig_handlers = src_logger.handlers[:]
+        orig_level = src_logger.level
+        orig_propagate = src_logger.propagate
+        orig_root_level = root_logger.level
+
+        try:
+            root_logger.setLevel(logging.WARNING)
+            assert configure_runtime_logging(force=True) is True
+
+            logging.getLogger("src.api").info("TELEMETRY | event=test_api")
+            logging.getLogger("src.x402_payment").info("TELEMETRY | event=test_x402")
+
+            captured = capsys.readouterr()
+            assert "TELEMETRY | event=test_api" in captured.out
+            assert "TELEMETRY | event=test_x402" in captured.out
+            assert logging.getLogger("httpx").getEffectiveLevel() >= logging.WARNING
+
+            # Second call with force=True must be idempotent (only 1 runtime handler attached)
+            assert configure_runtime_logging(force=True) is True
+            runtime_handlers = [
+                h for h in src_logger.handlers if getattr(h, "_web3_agent_runtime", False)
+            ]
+            assert len(runtime_handlers) == 1
+        finally:
+            src_logger.handlers[:] = orig_handlers
+            src_logger.setLevel(orig_level)
+            src_logger.propagate = orig_propagate
+            root_logger.setLevel(orig_root_level)

@@ -167,6 +167,27 @@ if not hasattr(X402Config, "price_atomic"):
 logger = logging.getLogger(__name__)
 
 
+def configure_runtime_logging(force: bool = False) -> bool:
+    """Configure INFO logging on the ``src`` namespace without altering root or third-party loggers."""
+    if not force and "pytest" in sys.modules:
+        return False
+
+    app_logger = logging.getLogger("src")
+    has_runtime_handler = any(
+        getattr(handler, "_web3_agent_runtime", False)
+        for handler in app_logger.handlers
+    )
+    if not has_runtime_handler:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter("%(levelname)s:     %(name)s - %(message)s"))
+        handler._web3_agent_runtime = True  # type: ignore[attr-defined]
+        app_logger.addHandler(handler)
+
+    app_logger.setLevel(logging.INFO)
+    app_logger.propagate = False
+    return True
+
+
 def _log_mcp_telemetry(msg: Any) -> None:
     """Emit a 1-line structured telemetry log for incoming MCP JSON-RPC requests."""
     if not isinstance(msg, dict):
@@ -649,6 +670,7 @@ def create_app(
     Creates and configures the FastAPI application instance.
     Allows injecting custom ConditionAgentEngine, AgentStorage, X402Config, and facilitator instances.
     """
+    configure_runtime_logging()
 
     if public_evaluate_only is not None:
         effective_public_evaluate_only = bool(public_evaluate_only)
@@ -669,6 +691,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app_instance: FastAPI):
+        configure_runtime_logging()
         if effective_enable_scanner:
             app_instance.state.scanner_active = True
             app_instance.state.scanner_task = asyncio.create_task(
