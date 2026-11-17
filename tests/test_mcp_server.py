@@ -891,6 +891,58 @@ class TestAgentDiscoveryTeachingAndSecurityHardening:
         assert "endpoints" in agent_data
         assert "skills" in agent_data
 
+    def test_mcp_server_card_aliases_under_standard_and_lockdown_modes(
+        self, test_client: TestClient, tmp_path: Path
+    ):
+        """
+        Validates that GET /mcp/server-card and GET /mcp/server-card.json:
+        - Return 200 OK (not 403 Forbidden) when create_app(..., public_evaluate_only=True) is enabled.
+        - Return 200 OK when public_evaluate_only=False as well.
+        - Return valid MCP server card JSON matching /.well-known/mcp/server-card.json
+          (including serverInfo, protocolVersion, tools, and remotes).
+        """
+        canonical_res = test_client.get("/.well-known/mcp/server-card.json")
+        assert canonical_res.status_code == 200
+        canonical_card = canonical_res.json()
+
+        for field in ("serverInfo", "protocolVersion", "tools", "remotes"):
+            assert field in canonical_card, f"Canonical server card missing '{field}'"
+        assert isinstance(canonical_card["remotes"], list) and len(canonical_card["remotes"]) > 0
+
+        # 1. Lockdown mode (public_evaluate_only=True via test_client fixture)
+        for alias_path in ("/mcp/server-card", "/mcp/server-card.json"):
+            res = test_client.get(alias_path)
+            assert res.status_code != 403, f"{alias_path} was blocked with 403 under public_evaluate_only=True"
+            assert res.status_code == 200, f"{alias_path} did not return 200 OK (got {res.status_code})"
+            data = res.json()
+            assert data == canonical_card
+            assert data["serverInfo"] == canonical_card["serverInfo"]
+            assert data["protocolVersion"] == canonical_card["protocolVersion"]
+            assert data["tools"] == canonical_card["tools"]
+            assert data["remotes"] == canonical_card["remotes"]
+
+        # 2. Standard mode (public_evaluate_only=False)
+        standard_storage = AgentStorage(db_path=str(tmp_path / "api_standard_card_test.db"))
+        standard_engine = ConditionAgentEngine(
+            semantic_evaluator=MockSemanticEvaluator(),
+            storage=standard_storage,
+        )
+        standard_client = TestClient(
+            create_app(
+                engine=standard_engine,
+                public_evaluate_only=False,
+                enable_background_scanner=False,
+            )
+        )
+        standard_canonical = standard_client.get("/.well-known/mcp/server-card.json")
+        assert standard_canonical.status_code == 200
+        standard_canonical_card = standard_canonical.json()
+
+        for alias_path in ("/mcp/server-card", "/mcp/server-card.json"):
+            res = standard_client.get(alias_path)
+            assert res.status_code == 200, f"{alias_path} did not return 200 OK in standard mode"
+            assert res.json() == standard_canonical_card
+
     def test_security_txt_endpoints(self, test_client: TestClient):
         """
         Validates security.txt standard endpoints:

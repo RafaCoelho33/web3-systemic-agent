@@ -827,6 +827,8 @@ def create_app(
                 "/.well-known/x402",
                 "/.well-known/mcp/server-card.json",
                 "/.well-known/mcp.json",
+                "/mcp/server-card",
+                "/mcp/server-card.json",
                 "/.well-known/agent.json",
                 "/.well-known/security.txt",
                 "/security.txt",
@@ -1147,6 +1149,8 @@ def create_app(
 
     @app.get("/.well-known/mcp/server-card.json", include_in_schema=False)
     @app.get("/.well-known/mcp.json", include_in_schema=False)
+    @app.get("/mcp/server-card", include_in_schema=False)
+    @app.get("/mcp/server-card.json", include_in_schema=False)
     async def get_mcp_server_card():
         """Returns official MCP server card metadata."""
         public_url = (
