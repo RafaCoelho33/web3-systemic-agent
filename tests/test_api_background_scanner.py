@@ -68,7 +68,10 @@ def test_activation_flag_resolution_defaults():
 def test_activation_flag_resolution_render_env():
     """When RENDER=true, scanner activates automatically by default."""
     with patch.dict(os.environ, {"RENDER": "true"}, clear=True):
-        with patch("src.api.asyncio.create_task") as mock_create_task:
+        with patch(
+            "src.api.asyncio.create_task",
+            side_effect=lambda coro: (coro.close(), MagicMock())[1],
+        ) as mock_create_task:
             app = create_app()
             # Lifespan context manager activation
             with TestClient(app):
@@ -79,7 +82,10 @@ def test_activation_flag_resolution_render_env():
 def test_activation_flag_resolution_enable_env():
     """When ENABLE_BACKGROUND_SCANNER=1, scanner activates."""
     with patch.dict(os.environ, {"ENABLE_BACKGROUND_SCANNER": "1"}, clear=True):
-        with patch("src.api.asyncio.create_task") as mock_create_task:
+        with patch(
+            "src.api.asyncio.create_task",
+            side_effect=lambda coro: (coro.close(), MagicMock())[1],
+        ) as mock_create_task:
             app = create_app()
             with TestClient(app):
                 assert app.state.scanner_active is True
@@ -89,7 +95,10 @@ def test_activation_flag_resolution_enable_env():
 def test_activation_flag_explicit_override_overrules_render_env():
     """Explicit enable_background_scanner=False disables scanner even if RENDER=true."""
     with patch.dict(os.environ, {"RENDER": "true"}, clear=True):
-        with patch("src.api.asyncio.create_task") as mock_create_task:
+        with patch(
+            "src.api.asyncio.create_task",
+            side_effect=lambda coro: (coro.close(), MagicMock())[1],
+        ) as mock_create_task:
             app = create_app(enable_background_scanner=False)
             with TestClient(app):
                 assert app.state.scanner_active is False

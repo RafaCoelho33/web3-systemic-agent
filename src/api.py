@@ -30,6 +30,7 @@ from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel, Field, ValidationError
 from web3 import Web3, AsyncWeb3, AsyncHTTPProvider
@@ -317,6 +318,319 @@ class RuleValidationResponse(BaseModel):
     message: str = Field(..., description="High-level validation summary")
     details: ValidationDetail = Field(..., description="Parsed rule attributes")
     warnings: List[str] = Field(default_factory=list, description="Non-fatal warnings or short-circuit hints")
+
+
+class RecentFeedResponse(BaseModel):
+    service: str = Field(..., description="Service identifier")
+    count: int = Field(..., description="Number of returned feed items")
+    items: List[Dict[str, Any]] = Field(default_factory=list, description="Recent contract and pool evaluations")
+
+
+class ContractReportResponse(BaseModel):
+    address: str
+    chain_id: int
+    chain_name: str
+    evaluated: bool
+    latest_decision: Optional[str] = None
+    risk_score: Optional[float] = None
+    verdict_badge: str
+    bytecode_cached: bool
+    bytecode_size_bytes: int
+    selectors_count: int
+    high_risk_signatures: List[str] = Field(default_factory=list)
+    honeypot_analysis: Optional[Dict[str, Any]] = None
+    rule_id: Optional[str] = None
+    source: Optional[str] = None
+    stage1_passed: Optional[bool] = None
+    llm_invoked: Optional[bool] = None
+    created_at: Optional[Any] = None
+    report_url: str
+    card_svg_url: str
+    token_check_x402_url: str
+    audit_x402_url: str
+    deep_audit_x402_url: str
+
+
+class MCPDiscoveryResponse(BaseModel):
+    name: str
+    version: str
+    protocolVersion: str
+    transport: str
+    tools: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class EnqueueJobResponse(BaseModel):
+    job_id: str
+    status: str
+    payment: Optional[PaymentReceipt] = None
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    result: Optional[Any] = None
+    error: Optional[str] = None
+    created_at: Optional[Any] = None
+    updated_at: Optional[Any] = None
+
+
+_STATIC_DISCOVERY_EXEMPT_PATHS = frozenset({
+    "/openapi.json",
+    "/robots.txt",
+    "/llms.txt",
+    "/llms-full.txt",
+    "/icon.svg",
+    "/favicon.svg",
+    "/favicon.ico",
+    "/security.txt",
+    "/mcp/server-card",
+    "/mcp/server-card.json",
+})
+
+_PAID_X402_PATHS = frozenset({
+    "/evaluate",
+    "/audit",
+    "/preflight",
+    "/audit/deep",
+    "/token/check",
+    "/rules/enqueue",
+    "/rules/evaluate-batch",
+})
+
+
+def _normalize_required_query_param(op: Dict[str, Any], param_name: str, fallback_desc: str) -> None:
+    """Mark an OpenAPI query parameter as required with a non-nullable string schema."""
+    for param in op.get("parameters", []):
+        if isinstance(param, dict) and param.get("in") == "query" and param.get("name") == param_name:
+            param["required"] = True
+            old_schema = param.get("schema") if isinstance(param.get("schema"), dict) else {}
+            desc = param.get("description") or old_schema.get("description") or fallback_desc
+            new_schema: Dict[str, Any] = {"type": "string", "description": desc}
+            if "title" in old_schema:
+                new_schema["title"] = old_schema["title"]
+            param["schema"] = new_schema
+
+
+def _normalize_required_schema_field(
+    schemas: Dict[str, Any],
+    schema_name: str,
+    field_name: str,
+) -> None:
+    """Mark a component schema field as required with a clean non-nullable string type."""
+    schema_obj = schemas.get(schema_name)
+    if not isinstance(schema_obj, dict):
+        return
+    required = schema_obj.get("required")
+    if not isinstance(required, list) or not required:
+        schema_obj["required"] = [field_name]
+    elif field_name not in required:
+        required.append(field_name)
+
+    props = schema_obj.get("properties")
+    if isinstance(props, dict) and isinstance(props.get(field_name), dict):
+        field_schema = props[field_name]
+        cleaned: Dict[str, Any] = {"type": "string"}
+        if "title" in field_schema:
+            cleaned["title"] = field_schema["title"]
+        if "description" in field_schema:
+            cleaned["description"] = field_schema["description"]
+        props[field_name] = cleaned
+
+
+def _enrich_openapi_schema(
+    openapi_schema: Dict[str, Any],
+    app_instance: FastAPI,
+    base_contact: Dict[str, str],
+    explicit_contact_email: Optional[str],
+) -> None:
+    """Enrich generated OpenAPI 3.1 schema for x402scan discovery and MCP/agent interoperability."""
+    info = openapi_schema.setdefault("info", {})
+    contact_dict = dict(base_contact)
+    if explicit_contact_email is None:
+        env_email = os.getenv("CONTACT_EMAIL", "").strip()
+        if env_email:
+            contact_dict["email"] = env_email
+        else:
+            contact_dict.pop("email", None)
+    info["contact"] = contact_dict
+    info["x-guidance"] = (
+        "Web3 Systemic Agent provides EVM security firewalls, smart contract audits, and honeypot detection. "
+        "Paid x402 endpoints: POST /token/check & GET /token/check ($0.005) for fast deterministic token/honeypot scan; "
+        "POST /preflight & GET /preflight ($0.01) for EVM transaction firewall screening; "
+        "POST /audit, GET /audit, POST /evaluate, and POST /rules/enqueue ($0.015) for two-stage contract & governance audits; "
+        "POST /audit/deep ($0.25) for proxy slot & verified Solidity source audits; "
+        "POST /rules/evaluate-batch for batch rule audits. "
+        "Free endpoints: GET /mcp & POST /mcp (Model Context Protocol JSON-RPC tools), GET /feed/recent (live security feed), "
+        "GET /report/{chain_id}/{address} (cached contract reports), POST /rules/validate (dry-run rule syntax validation), "
+        "GET /jobs/{job_id} (async job polling), and GET /health. "
+        "To pay via x402 v2: call any paid endpoint without a payment header to receive HTTP 402 with a base64 Payment-Required header, "
+        "then retry with a signed EIP-3009 USDC authorization in PAYMENT-SIGNATURE or X-PAYMENT."
+    )
+
+    components = openapi_schema.setdefault("components", {})
+
+    x402_cfg: X402Config = getattr(app_instance.state, "x402_config", None) or X402Config()
+    paths = openapi_schema.get("paths", {})
+
+    fixed_paid_ops: Dict[tuple[str, str], float] = {
+        ("/token/check", "get"): x402_cfg.price_per_token_check_usdc,
+        ("/token/check", "post"): x402_cfg.price_per_token_check_usdc,
+        ("/preflight", "get"): x402_cfg.price_per_preflight_usdc,
+        ("/preflight", "post"): x402_cfg.price_per_preflight_usdc,
+        ("/audit", "get"): x402_cfg.price_per_eval_usdc,
+        ("/audit", "post"): x402_cfg.price_per_eval_usdc,
+        ("/evaluate", "post"): x402_cfg.price_per_eval_usdc,
+        ("/rules/enqueue", "post"): x402_cfg.price_per_eval_usdc,
+        ("/audit/deep", "post"): x402_cfg.price_per_deep_audit_usdc,
+    }
+    dynamic_paid_ops: Dict[tuple[str, str], tuple[str, str]] = {
+        ("/rules/evaluate-batch", "post"): (
+            f"{x402_cfg.price_per_eval_usdc:.6f}",
+            f"{x402_cfg.price_per_eval_usdc * get_batch_max_items():.6f}",
+        ),
+    }
+    gate_gov = os.getenv("X402_GATE_GOVERNANCE", "false").strip().lower() in ("true", "1", "yes")
+    if gate_gov and "/governance/audit-proposals" in paths:
+        dynamic_paid_ops[("/governance/audit-proposals", "post")] = (
+            f"{x402_cfg.price_per_eval_usdc:.6f}",
+            f"{x402_cfg.price_per_eval_usdc * 20:.6f}",
+        )
+
+    for path_key, path_item in paths.items():
+        if not isinstance(path_item, dict):
+            continue
+        for method in ("get", "post", "put", "delete", "patch"):
+            op = path_item.get(method)
+            if not isinstance(op, dict):
+                continue
+            op_key = (path_key, method)
+            if op_key in fixed_paid_ops:
+                price = fixed_paid_ops[op_key]
+                op.pop("security", None)
+                op["x-payment-info"] = {
+                    "price": {
+                        "mode": "fixed",
+                        "currency": "USD",
+                        "amount": f"{price:.6f}",
+                    },
+                    "protocols": [{"x402": {}}],
+                }
+                op.setdefault("responses", {})["402"] = {
+                    "description": "Payment Required — x402 v2 payment challenge returned in Payment-Required header and JSON body."
+                }
+            elif op_key in dynamic_paid_ops:
+                min_str, max_str = dynamic_paid_ops[op_key]
+                op.pop("security", None)
+                op["x-payment-info"] = {
+                    "price": {
+                        "mode": "dynamic",
+                        "currency": "USD",
+                        "min": min_str,
+                        "max": max_str,
+                    },
+                    "protocols": [{"x402": {}}],
+                }
+                op.setdefault("responses", {})["402"] = {
+                    "description": "Payment Required — x402 v2 payment challenge returned in Payment-Required header and JSON body."
+                }
+            else:
+                op["security"] = []
+
+    token_check_get_op = paths.get("/token/check", {}).get("get")
+    if isinstance(token_check_get_op, dict):
+        _normalize_required_query_param(
+            token_check_get_op,
+            "address",
+            "Hex EVM token contract address to check",
+        )
+
+    audit_get_op = paths.get("/audit", {}).get("get")
+    if isinstance(audit_get_op, dict):
+        _normalize_required_query_param(
+            audit_get_op,
+            "address",
+            "Hex EVM smart contract address to audit",
+        )
+
+    preflight_get_op = paths.get("/preflight", {}).get("get")
+    if isinstance(preflight_get_op, dict):
+        _normalize_required_query_param(
+            preflight_get_op,
+            "to_address",
+            "Target EVM contract or recipient address",
+        )
+
+    schemas = components.setdefault("schemas", {})
+    _normalize_required_schema_field(schemas, "QuickAuditRequest", "target_address")
+    _normalize_required_schema_field(schemas, "DeepAuditRequest", "target_address")
+    _normalize_required_schema_field(schemas, "TokenCheckRequest", "address")
+    _normalize_required_schema_field(schemas, "PreflightRequest", "to_address")
+
+    svg_get_op = paths.get("/report/{chain_id}/{address}/card.svg", {}).get("get")
+    if isinstance(svg_get_op, dict):
+        svg_get_op.setdefault("responses", {})["200"] = {
+            "description": "Successful Response",
+            "content": {
+                "image/svg+xml": {
+                    "schema": {
+                        "type": "string",
+                        "description": "SVG OpenGraph security badge card",
+                    }
+                }
+            },
+        }
+
+    mcp_post_op = paths.get("/mcp", {}).get("post")
+    if isinstance(mcp_post_op, dict):
+        mcp_post_op["requestBody"] = {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "jsonrpc": {"type": "string", "default": "2.0"},
+                            "id": {
+                                "anyOf": [
+                                    {"type": "string"},
+                                    {"type": "integer"},
+                                    {"type": "null"},
+                                ]
+                            },
+                            "method": {
+                                "type": "string",
+                                "description": "MCP JSON-RPC method (e.g. initialize, tools/list, tools/call, ping)",
+                            },
+                            "params": {"type": "object", "additionalProperties": True},
+                        },
+                        "required": ["jsonrpc", "method"],
+                    }
+                }
+            },
+        }
+        mcp_post_op.setdefault("responses", {})["200"] = {
+            "description": "Successful JSON-RPC 2.0 Response",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "jsonrpc": {"type": "string", "default": "2.0"},
+                            "id": {
+                                "anyOf": [
+                                    {"type": "string"},
+                                    {"type": "integer"},
+                                    {"type": "null"},
+                                ]
+                            },
+                            "result": {"type": "object", "additionalProperties": True},
+                            "error": {"type": "object", "additionalProperties": True},
+                        },
+                        "required": ["jsonrpc"],
+                    }
+                }
+            },
+        }
 
 
 # -------------------------------------------------------------------------
@@ -1649,6 +1963,7 @@ def create_app(
     rate_limit_per_minute: Optional[int] = None,
     public_evaluate_only: Optional[bool] = None,
     enable_background_scanner: Optional[bool] = None,
+    contact_email: Optional[str] = None,
 ) -> FastAPI:
     """
     Creates and configures the FastAPI application instance.
@@ -1700,6 +2015,18 @@ def create_app(
         if hasattr(app_instance.state, "worker_pool") and app_instance.state.worker_pool:
             await app_instance.state.worker_pool.shutdown()
 
+    effective_contact_email = (
+        contact_email
+        if contact_email is not None
+        else os.getenv("CONTACT_EMAIL", "")
+    ).strip()
+    openapi_contact: Dict[str, str] = {
+        "name": "RafaCoelho33",
+        "url": "https://github.com/RafaCoelho33/web3-systemic-agent",
+    }
+    if effective_contact_email:
+        openapi_contact["email"] = effective_contact_email
+
     app = FastAPI(
         title="Web3 Condition-Action Trigger Agent",
         version="1.0.2",
@@ -1707,6 +2034,7 @@ def create_app(
             "Autonomous Web3 Agent for deterministic on-chain gatekeeping "
             "and LLM-powered semantic governance/security auditing."
         ),
+        contact=openapi_contact,
         lifespan=lifespan,
         docs_url=None if effective_public_evaluate_only else "/docs",
         redoc_url=None if effective_public_evaluate_only else "/redoc",
@@ -1746,31 +2074,58 @@ def create_app(
     @app.middleware("http")
     async def x402_evaluate_interceptor(request: Request, call_next):
         clean_path = request.url.path.rstrip("/")
-        if clean_path in ("/evaluate", "/audit", "/preflight", "/audit/deep", "/token/check") and request.method in ("GET", "POST"):
+        if clean_path in _PAID_X402_PATHS and request.method in ("GET", "POST"):
             x402_cfg: X402Config = getattr(app.state, "x402_config", None) or X402Config()
-            if x402_cfg.enabled:
-                payment_hdr = (
-                    request.headers.get("x-payment")
-                    or request.headers.get("payment-signature")
-                    or request.headers.get("x-payment-signature")
-                    or request.headers.get("X-PAYMENT")
-                    or request.headers.get("PAYMENT-SIGNATURE")
-                )
-                has_payment = bool(payment_hdr and payment_hdr.strip())
-                if not has_payment:
-                    if clean_path == "/preflight":
-                        req_price = x402_cfg.price_per_preflight_usdc
-                    elif clean_path == "/audit/deep":
-                        req_price = x402_cfg.price_per_deep_audit_usdc
-                    elif clean_path == "/token/check":
-                        req_price = x402_cfg.price_per_token_check_usdc
-                    else:
-                        req_price = x402_cfg.price_per_eval_usdc
+            if x402_cfg.enabled and not _extract_payment_header(request):
+                if clean_path == "/rules/enqueue":
                     return build_402_response(
                         x402_cfg,
                         request.url.path,
-                        req_price,
+                        x402_cfg.price_per_eval_usdc,
                     )
+                if clean_path == "/rules/evaluate-batch":
+                    if request.method == "GET":
+                        return build_402_response(
+                            x402_cfg,
+                            request.url.path,
+                            x402_cfg.price_per_eval_usdc,
+                        )
+                    raw_body = await request.body()
+                    parsed = None
+                    if raw_body:
+                        try:
+                            parsed = json.loads(raw_body)
+                        except Exception:
+                            parsed = None
+                    if isinstance(parsed, list):
+                        if len(parsed) == 0:
+                            return await call_next(request)
+                        batch_count = min(len(parsed), get_batch_max_items())
+                        req_price = round(x402_cfg.price_per_eval_usdc * batch_count, 6)
+                        return build_402_response(
+                            x402_cfg,
+                            request.url.path,
+                            req_price,
+                        )
+                    return build_402_response(
+                        x402_cfg,
+                        request.url.path,
+                        x402_cfg.price_per_eval_usdc,
+                    )
+
+                if clean_path == "/preflight":
+                    req_price = x402_cfg.price_per_preflight_usdc
+                elif clean_path == "/audit/deep":
+                    req_price = x402_cfg.price_per_deep_audit_usdc
+                elif clean_path == "/token/check":
+                    req_price = x402_cfg.price_per_token_check_usdc
+                else:
+                    req_price = x402_cfg.price_per_eval_usdc
+                return build_402_response(
+                    x402_cfg,
+                    request.url.path,
+                    req_price,
+                )
         return await call_next(request)
 
     # 2. Public Evaluate-Only Lockdown Mode
@@ -1788,6 +2143,7 @@ def create_app(
                 "/",
                 "/openapi.json",
                 "/favicon.ico",
+                "/favicon.svg",
                 "/icon.svg",
                 "/health",
                 "/evaluate",
@@ -1832,9 +2188,9 @@ def create_app(
 
     # 3. Per-IP Sliding-Window Rate Limiter
     try:
-        default_rate_limit = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
+        default_rate_limit = int(os.getenv("RATE_LIMIT_PER_MINUTE", "300"))
     except (ValueError, TypeError):
-        default_rate_limit = 60
+        default_rate_limit = 300
     effective_rate_limit = (
         rate_limit_per_minute
         if rate_limit_per_minute is not None
@@ -1846,6 +2202,23 @@ def create_app(
     if effective_rate_limit > 0:
         @app.middleware("http")
         async def rate_limit_middleware(request: Request, call_next):
+            if rate_limit_per_minute is None:
+                clean_rl_path = request.url.path.rstrip("/") or "/"
+                if (
+                    clean_rl_path in _STATIC_DISCOVERY_EXEMPT_PATHS
+                    or clean_rl_path.startswith("/.well-known/")
+                    or clean_rl_path.startswith("/mcp/.well-known/")
+                ):
+                    return await call_next(request)
+
+                x402_cfg: X402Config = getattr(app.state, "x402_config", None) or X402Config()
+                if (
+                    clean_rl_path in _PAID_X402_PATHS
+                    and x402_cfg.enabled
+                    and not _extract_payment_header(request)
+                ):
+                    return await call_next(request)
+
             client_ip = (
                 request.headers.get("cf-connecting-ip")
                 or (request.headers.get("x-forwarded-for", "").split(",")[0].strip())
@@ -2076,6 +2449,7 @@ def create_app(
 
     @app.get(
         "/feed/recent",
+        response_model=RecentFeedResponse,
         tags=["Monitoring"],
         summary="Live Autonomous Contract & Pool Security Feed",
     )
@@ -2148,6 +2522,7 @@ def create_app(
 
     @app.get(
         "/report/{chain_id}/{address}",
+        response_model=ContractReportResponse,
         tags=["Monitoring"],
         summary="Shareable Contract Security Report (HTML or JSON)",
     )
@@ -2220,6 +2595,7 @@ def create_app(
 
     @app.get(
         "/mcp",
+        response_model=MCPDiscoveryResponse,
         tags=["MCP Server"],
         summary="MCP Discovery and Tools Manifest",
     )
@@ -2332,6 +2708,7 @@ def create_app(
         return Response(content=LLMS_FULL_TXT_CONTENT, media_type="text/plain; charset=utf-8")
 
     @app.api_route("/icon.svg", methods=["GET", "HEAD"], include_in_schema=False)
+    @app.api_route("/favicon.svg", methods=["GET", "HEAD"], include_in_schema=False)
     async def get_icon_svg():
         """Returns static server SVG icon."""
         return Response(content=ICON_SVG_CONTENT, media_type="image/svg+xml")
@@ -2770,7 +3147,7 @@ def create_app(
             warnings=warnings,
         )
 
-    @app.get("/evaluate", tags=["Evaluation"], summary="x402 Payment & Bazaar Discovery Metadata")
+    @app.get("/evaluate", include_in_schema=False, tags=["Evaluation"], summary="x402 Payment & Bazaar Discovery Metadata")
     async def evaluate_discovery(request: Request):
         """
         Returns HTTP 402 Payment Required response containing x402 payment requirements
@@ -2947,7 +3324,7 @@ def create_app(
         agent_resp.payment = receipt
         return agent_resp
 
-    @app.get("/audit", tags=["Evaluation"], summary="x402 Quick Audit Discovery & Execution")
+    @app.get("/audit", response_model=FinalAgentResponse, tags=["Evaluation"], summary="x402 Quick Audit Discovery & Execution")
     async def audit_discovery(
         request: Request,
         response: Response,
@@ -3216,7 +3593,7 @@ def create_app(
         agent_resp.payment = receipt
         return agent_resp
 
-    @app.get("/preflight", tags=["Evaluation"], summary="x402 Preflight Firewall Discovery & Execution")
+    @app.get("/preflight", response_model=PreflightVerdict, tags=["Evaluation"], summary="x402 Preflight Firewall Discovery & Execution")
     async def preflight_discovery(
         request: Request,
         response: Response,
@@ -3426,7 +3803,7 @@ def create_app(
         verdict.payment = receipt
         return verdict
 
-    @app.get("/audit/deep", tags=["Evaluation"], summary="x402 Deep Source & Proxy Audit Discovery Metadata")
+    @app.get("/audit/deep", include_in_schema=False, tags=["Evaluation"], summary="x402 Deep Source & Proxy Audit Discovery Metadata")
     async def deep_audit_discovery(request: Request):
         """
         Returns HTTP 402 Payment Required response containing x402 payment requirements
@@ -4079,7 +4456,7 @@ def create_app(
             payment=receipt,
         )
 
-    @app.get("/token/check", tags=["Evaluation"], summary="Fast Micro-Tier Token & Honeypot Check (GET)")
+    @app.get("/token/check", response_model=TokenCheckResponse, tags=["Evaluation"], summary="Fast Micro-Tier Token & Honeypot Check (GET)")
     async def token_check_get(
         request: Request,
         response: Response,
@@ -4311,7 +4688,13 @@ def create_app(
 
         return results
 
-    @app.post("/rules/enqueue", status_code=status.HTTP_202_ACCEPTED, tags=["Asynchronous Tasks"])
+    @app.post(
+        "/rules/enqueue",
+        status_code=status.HTTP_202_ACCEPTED,
+        response_model=EnqueueJobResponse,
+        response_model_exclude_none=True,
+        tags=["Asynchronous Tasks"],
+    )
     async def enqueue_rule(
         payload: ConditionRulePayload,
         request: Request,
@@ -4450,7 +4833,7 @@ def create_app(
             "payment": receipt.model_dump(),
         }
 
-    @app.get("/jobs/{job_id}", tags=["Asynchronous Tasks"])
+    @app.get("/jobs/{job_id}", response_model=JobStatusResponse, tags=["Asynchronous Tasks"])
     async def get_job_status(job_id: str):
         """
         Retrieves the status, result, or error of an asynchronous evaluation job.
@@ -4675,6 +5058,34 @@ def create_app(
         response.headers["PAYMENT-RESPONSE"] = receipt_summary
 
         return reports
+
+    def custom_openapi() -> Dict[str, Any]:
+        if app.openapi_schema:
+            return app.openapi_schema
+        openapi_schema = get_openapi(
+            title=app.title,
+            version=app.version,
+            openapi_version=app.openapi_version,
+            summary=app.summary,
+            description=app.description,
+            terms_of_service=app.terms_of_service,
+            contact=app.contact,
+            license_info=app.license_info,
+            routes=app.routes,
+            tags=app.openapi_tags,
+            servers=app.servers,
+            separate_input_output_schemas=app.separate_input_output_schemas,
+        )
+        _enrich_openapi_schema(
+            openapi_schema=openapi_schema,
+            app_instance=app,
+            base_contact=openapi_contact,
+            explicit_contact_email=contact_email,
+        )
+        app.openapi_schema = openapi_schema
+        return app.openapi_schema
+
+    app.openapi = custom_openapi
 
     return app
 

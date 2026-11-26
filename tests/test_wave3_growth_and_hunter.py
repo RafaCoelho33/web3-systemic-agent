@@ -793,3 +793,102 @@ class TestWave3FeedAndShareableReports:
             assert expected_og_img in html_resp.text
             assert 'name="twitter:card"' in html_resp.text
             assert f"/report/8453/{self.USDC_BASE}/card.svg" in html_resp.text
+
+
+# =========================================================================
+# 5. OpenAPI Metadata & Contact Info (GET /openapi.json)
+# =========================================================================
+
+
+class TestOpenAPIContactMetadata:
+    """Validates OpenAPI info metadata and info.contact resolution."""
+
+    EXPECTED_TITLE = "Web3 Condition-Action Trigger Agent"
+    EXPECTED_VERSION = "1.0.2"
+    EXPECTED_DESCRIPTION = (
+        "Autonomous Web3 Agent for deterministic on-chain gatekeeping "
+        "and LLM-powered semantic governance/security auditing."
+    )
+    BASE_CONTACT = {
+        "name": "RafaCoelho33",
+        "url": "https://github.com/RafaCoelho33/web3-systemic-agent",
+    }
+
+    @staticmethod
+    def _create_openapi_app(tmp_path: Path, db_name: str, **kwargs: Any):
+        storage = AgentStorage(db_path=str(tmp_path / db_name))
+        engine = ConditionAgentEngine(
+            semantic_evaluator=MockSemanticEvaluator(),
+            storage=storage,
+        )
+        return create_app(
+            engine=engine,
+            storage=storage,
+            x402_config=X402Config(enabled=True),
+            facilitator=MockX402Facilitator(),
+            public_evaluate_only=True,
+            enable_background_scanner=False,
+            rate_limit_per_minute=0,
+            **kwargs,
+        )
+
+    def test_openapi_contact_includes_email_from_env_when_public_evaluate_only(
+        self, tmp_path: Path, monkeypatch
+    ):
+        monkeypatch.setenv("CONTACT_EMAIL", "merchant@example.com")
+        app = self._create_openapi_app(tmp_path, "openapi_env.db")
+
+        with TestClient(app) as client:
+            resp = client.get("/openapi.json")
+            assert resp.status_code == 200
+            data = resp.json()
+
+        info = data["info"]
+        assert info["title"] == self.EXPECTED_TITLE
+        assert info["version"] == self.EXPECTED_VERSION
+        assert info["description"] == self.EXPECTED_DESCRIPTION
+        assert info["contact"] == {
+            **self.BASE_CONTACT,
+            "email": "merchant@example.com",
+        }
+
+    @pytest.mark.parametrize("env_value", [None, "   "])
+    def test_openapi_contact_omits_email_when_missing_or_whitespace(
+        self, tmp_path: Path, monkeypatch, env_value
+    ):
+        if env_value is None:
+            monkeypatch.delenv("CONTACT_EMAIL", raising=False)
+        else:
+            monkeypatch.setenv("CONTACT_EMAIL", env_value)
+
+        app = self._create_openapi_app(tmp_path, "openapi_no_email.db")
+
+        with TestClient(app) as client:
+            resp = client.get("/openapi.json")
+            assert resp.status_code == 200
+            data = resp.json()
+
+        contact = data["info"]["contact"]
+        assert "email" not in contact
+        assert contact == self.BASE_CONTACT
+
+    def test_openapi_contact_parameter_overrides_env_var(
+        self, tmp_path: Path, monkeypatch
+    ):
+        monkeypatch.setenv("CONTACT_EMAIL", "merchant@example.com")
+        app = self._create_openapi_app(
+            tmp_path,
+            "openapi_override.db",
+            contact_email="override@example.com",
+        )
+
+        with TestClient(app) as client:
+            resp = client.get("/openapi.json")
+            assert resp.status_code == 200
+            data = resp.json()
+
+        assert data["info"]["contact"] == {
+            **self.BASE_CONTACT,
+            "email": "override@example.com",
+        }
+
