@@ -1649,6 +1649,7 @@ def create_app(
     rate_limit_per_minute: Optional[int] = None,
     public_evaluate_only: Optional[bool] = None,
     enable_background_scanner: Optional[bool] = None,
+    contact_email: Optional[str] = None,
 ) -> FastAPI:
     """
     Creates and configures the FastAPI application instance.
@@ -1700,6 +1701,18 @@ def create_app(
         if hasattr(app_instance.state, "worker_pool") and app_instance.state.worker_pool:
             await app_instance.state.worker_pool.shutdown()
 
+    effective_contact_email = (
+        contact_email
+        if contact_email is not None
+        else os.getenv("CONTACT_EMAIL", "")
+    ).strip()
+    openapi_contact: Dict[str, str] = {
+        "name": "RafaCoelho33",
+        "url": "https://github.com/RafaCoelho33/web3-systemic-agent",
+    }
+    if effective_contact_email:
+        openapi_contact["email"] = effective_contact_email
+
     app = FastAPI(
         title="Web3 Condition-Action Trigger Agent",
         version="1.0.2",
@@ -1707,6 +1720,7 @@ def create_app(
             "Autonomous Web3 Agent for deterministic on-chain gatekeeping "
             "and LLM-powered semantic governance/security auditing."
         ),
+        contact=openapi_contact,
         lifespan=lifespan,
         docs_url=None if effective_public_evaluate_only else "/docs",
         redoc_url=None if effective_public_evaluate_only else "/redoc",
