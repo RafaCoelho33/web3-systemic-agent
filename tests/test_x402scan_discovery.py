@@ -30,6 +30,10 @@ Covers all 5 compliance rules from `erro_fix.txt` and `https://www.x402scan.com/
    - 120-request high-burst crawl simulation under `rate_limit_per_minute=None` yields
      zero `429` responses, while explicit `rate_limit_per_minute=2` still enforces `429`
      on `/` and `/health`.
+5. Render/Docker Packaging & Bazaar Fallback Parity (`TestX402ScanRenderDockerParity`):
+   - `requirements.txt` and `pyproject.toml` declare `jsonschema` and `HAS_X402_SDK is True`.
+   - Every paid route returns `extensions.bazaar.schema.properties.input` and `.output`
+     as non-empty dicts under both `HAS_X402_SDK=True` and `HAS_X402_SDK=False`.
 """
 
 import base64
@@ -64,6 +68,7 @@ from src.schemas import (
 )
 from src.semantic_evaluator import MockSemanticEvaluator
 from src.storage import AgentStorage
+import src.x402_payment as x402_payment
 from src.x402_payment import MockX402Facilitator, X402Config
 
 
@@ -716,4 +721,81 @@ class TestX402ScanFullCrawlSimulation:
                 third = client.get(endpoint, headers=headers)
                 assert third.status_code == 429, (
                     f"Expected 429 on 3rd request to {endpoint} with rate_limit_per_minute=2, got {third.status_code}"
+                )
+
+
+# =============================================================================
+# 5. Render / Docker Packaging & Bazaar Fallback Parity
+# =============================================================================
+class TestX402ScanRenderDockerParity:
+    """Validates jsonschema packaging parity and Bazaar input/output schema in normal & fallback modes."""
+
+    def test_requirements_and_pyproject_include_jsonschema_for_x402_bazaar(self):
+        req_path = Path(ROOT_DIR) / "requirements.txt"
+        pyproject_path = Path(ROOT_DIR) / "pyproject.toml"
+
+        req_text = req_path.read_text(encoding="utf-8")
+        pyproject_text = pyproject_path.read_text(encoding="utf-8")
+
+        assert "jsonschema" in req_text.lower(), (
+            "requirements.txt must declare jsonschema so x402.extensions.bazaar imports in Docker"
+        )
+        assert "jsonschema" in pyproject_text.lower(), (
+            "pyproject.toml must declare jsonschema so x402.extensions.bazaar imports in clean builds"
+        )
+        assert x402_payment.HAS_X402_SDK is True
+
+    @pytest.mark.parametrize("sdk_enabled", [True, False])
+    def test_bazaar_schema_properties_input_and_output_present_with_and_without_sdk(
+        self,
+        temp_storage: AgentStorage,
+        monkeypatch: pytest.MonkeyPatch,
+        sdk_enabled: bool,
+    ):
+        monkeypatch.setattr(x402_payment, "HAS_X402_SDK", sdk_enabled)
+        if "x402_payment" in sys.modules and sys.modules["x402_payment"] is not x402_payment:
+            monkeypatch.setattr(sys.modules["x402_payment"], "HAS_X402_SDK", sdk_enabled)
+
+        app = _build_app(temp_storage, public_evaluate_only=True)
+        paid_probes: List[Tuple[str, str]] = [
+            ("POST", "/evaluate"),
+            ("GET", "/audit"),
+            ("POST", "/audit"),
+            ("GET", "/preflight"),
+            ("POST", "/preflight"),
+            ("POST", "/audit/deep"),
+            ("GET", "/token/check"),
+            ("POST", "/token/check"),
+            ("POST", "/rules/enqueue"),
+            ("POST", "/rules/evaluate-batch"),
+        ]
+
+        with TestClient(app) as client:
+            for method, path in paid_probes:
+                resp = client.get(path) if method == "GET" else client.post(path, json={})
+                assert resp.status_code == 402, (
+                    f"{method} {path} (HAS_X402_SDK={sdk_enabled}) expected 402, got {resp.status_code}"
+                )
+
+                body = resp.json()
+                bazaar_ext = body.get("extensions", {}).get("bazaar", {})
+                assert isinstance(bazaar_ext, dict) and bazaar_ext, (
+                    f"{method} {path} missing extensions.bazaar"
+                )
+                bazaar_schema = bazaar_ext.get("schema", {})
+                assert isinstance(bazaar_schema, dict), (
+                    f"{method} {path} extensions.bazaar.schema must be a dict"
+                )
+                props = bazaar_schema.get("properties")
+                assert isinstance(props, dict), (
+                    f"{method} {path} (HAS_X402_SDK={sdk_enabled}) bazaar.schema missing 'properties': {bazaar_schema!r}"
+                )
+
+                input_schema = props.get("input")
+                output_schema = props.get("output")
+                assert isinstance(input_schema, dict) and len(input_schema) > 0, (
+                    f"{method} {path} (HAS_X402_SDK={sdk_enabled}) missing non-empty schema.properties.input: {props!r}"
+                )
+                assert isinstance(output_schema, dict) and len(output_schema) > 0, (
+                    f"{method} {path} (HAS_X402_SDK={sdk_enabled}) missing non-empty schema.properties.output: {props!r}"
                 )

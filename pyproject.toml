@@ -32,7 +32,8 @@ dependencies = [
     "google-genai>=2.33.0",
     "python-dotenv>=1.2.2",
     "aiosqlite>=0.20.0",
-    "x402>=2.0.0",
+    "x402[evm,httpx]>=2.0.0",
+    "jsonschema>=4.0.0",
 ]
 
 [project.urls]

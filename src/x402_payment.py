@@ -89,15 +89,24 @@ try:
         ExactEvmClientScheme,
         ExactEvmServerScheme,
     )
+    HAS_X402_SDK = True
+except ImportError as exc:
+    HAS_X402_SDK = False
+    logger.warning("x402 SDK import failed: %s", exc)
+
+try:
     from x402.extensions.bazaar import (
         declare_discovery_extension,
         OutputConfig,
         bazaar_resource_server_extension,
     )
-    HAS_X402_SDK = True
+    HAS_X402_BAZAAR = True
 except ImportError as exc:
-    HAS_X402_SDK = False
-    logger.warning("x402 SDK import failed: %s", exc)
+    HAS_X402_BAZAAR = False
+    declare_discovery_extension = None  # type: ignore[assignment]
+    OutputConfig = None  # type: ignore[assignment]
+    bazaar_resource_server_extension = None  # type: ignore[assignment]
+    logger.warning("x402 bazaar extension import failed: %s", exc)
 
 # Protocol Constants
 USDC_DECIMALS: int = 6
@@ -648,7 +657,7 @@ def build_bazaar_discovery_extension(endpoint: str = "/evaluate", method: str = 
         input_schema = ConditionRulePayload.model_json_schema()
         output_schema = FinalAgentResponse.model_json_schema()
 
-    if HAS_X402_SDK:
+    if HAS_X402_SDK and HAS_X402_BAZAAR:
         try:
             res = declare_discovery_extension(
                 input=sample_input,
@@ -683,6 +692,30 @@ def build_bazaar_discovery_extension(endpoint: str = "/evaluate", method: str = 
                 },
             },
             "schema": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "input": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string", "const": "http"},
+                            "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"]},
+                            "bodyType": {"type": "string", "enum": ["json", "form-data", "text"]},
+                            "body": input_schema,
+                        },
+                        "required": ["type", "method", "bodyType", "body"],
+                        "additionalProperties": False,
+                    },
+                    "output": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string"},
+                            "example": output_schema,
+                        },
+                        "required": ["type"],
+                    },
+                },
+                "required": ["input"],
                 "input": input_schema,
                 "output": output_schema,
             },
@@ -997,7 +1030,7 @@ class HTTPX402Facilitator:
             fac = HTTPFacilitatorClientSync(fac_cfg)
             srv = x402ResourceServerSync(fac)
             srv.register(network, ExactEvmServerScheme())
-            if hasattr(srv, "register_extension") and HAS_X402_SDK:
+            if hasattr(srv, "register_extension") and HAS_X402_SDK and HAS_X402_BAZAAR:
                 try:
                     srv.register_extension(bazaar_resource_server_extension)
                 except Exception as ext_err:
@@ -1089,7 +1122,7 @@ class HTTPX402Facilitator:
             fac = HTTPFacilitatorClientSync(fac_cfg)
             srv = x402ResourceServerSync(fac)
             srv.register(network, ExactEvmServerScheme())
-            if hasattr(srv, "register_extension") and HAS_X402_SDK:
+            if hasattr(srv, "register_extension") and HAS_X402_SDK and HAS_X402_BAZAAR:
                 try:
                     srv.register_extension(bazaar_resource_server_extension)
                 except Exception as ext_err:
