@@ -611,7 +611,7 @@ class TestSection3StoragePayments:
 class TestSection4X402Module:
     def test_x402_constants(self):
         """Contract 4: Validates standard x402 protocol constants."""
-        assert DEFAULT_X402_PRICE_USDC == 0.01
+        assert DEFAULT_X402_PRICE_USDC == 0.015
         assert DEFAULT_X402_NETWORK == "eip155:84532"
         assert DEFAULT_PAY_TO_ADDRESS == "0x0000000000000000000000000000000000000001"
         assert DEFAULT_FACILITATOR_URL == "https://x402.org/facilitator"
@@ -623,7 +623,7 @@ class TestSection4X402Module:
         """Contract 4: X402Config default values conform to contract."""
         cfg = X402Config()
         assert cfg.enabled is False
-        assert cfg.price_per_eval_usdc == 0.01
+        assert cfg.price_per_eval_usdc == 0.015
         assert cfg.network == "eip155:84532"
         assert cfg.pay_to_address == Web3.to_checksum_address(DEFAULT_PAY_TO_ADDRESS)
         assert cfg.facilitator_url == DEFAULT_FACILITATOR_URL

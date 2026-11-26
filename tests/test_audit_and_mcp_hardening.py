@@ -561,11 +561,14 @@ class TestFastAPIAuditAndWellKnownX402:
         assert data["x402Version"] == 2
         assert data["service"] == "Web3 Systemic Agent"
         assert data["network"] == "eip155:8453"
-        assert len(data["resources"]) == 2
+        assert len(data["resources"]) == 5
 
         endpoints = [r["endpoint"] for r in data["resources"]]
         assert "/evaluate" in endpoints
         assert "/audit" in endpoints
+        assert "/preflight" in endpoints
+        assert "/audit/deep" in endpoints
+        assert "/token/check" in endpoints
 
     def test_get_audit_returns_402(self, app_client: TestClient):
         """Validates GET /audit returns HTTP 402 with Bazaar discovery metadata."""

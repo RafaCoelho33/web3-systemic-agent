@@ -446,6 +446,57 @@ def extract_selectors_from_bytecode(
     return list(found.values())
 
 
+def has_selfdestruct_opcode(bytecode: Union[bytes, str]) -> bool:
+    """
+    Scans EVM runtime bytecode for the SELFDESTRUCT opcode (0xff), stripping
+    Solidity CBOR metadata suffixes and skipping PUSH1..PUSH32 immediate operands
+    to prevent false positives on bitmasks (e.g., 0xff..ff) or compiler hashes.
+    """
+    if not bytecode:
+        return False
+
+    if isinstance(bytecode, (bytes, bytearray)):
+        code = bytes(bytecode)
+    elif isinstance(bytecode, str):
+        clean_hex = bytecode.strip()
+        if clean_hex.startswith(("0x", "0X")):
+            clean_hex = clean_hex[2:]
+        if not clean_hex:
+            return False
+        try:
+            code = bytes.fromhex(clean_hex)
+        except ValueError:
+            return False
+    else:
+        return False
+
+    if not code:
+        return False
+
+    # Strip Solidity compiler CBOR metadata suffix if present
+    if len(code) >= 2:
+        meta_len = int.from_bytes(code[-2:], "big")
+        if 0 < meta_len and meta_len + 2 <= len(code):
+            meta_block = code[-(meta_len + 2):-2]
+            if meta_block and meta_block[0] in (0xA1, 0xA2) and any(
+                tag in meta_block for tag in (b"ipfs", b"bzzr", b"solc")
+            ):
+                code = code[:-(meta_len + 2)]
+
+    pc = 0
+    code_len = len(code)
+    while pc < code_len:
+        op = code[pc]
+        if op == 0xFF:
+            return True
+        if 0x60 <= op <= 0x7F:
+            pc += 1 + (op - 0x5F)
+        else:
+            pc += 1
+
+    return False
+
+
 def analyze_bytecode_honeypot(bytecode: Union[bytes, str]) -> Dict[str, Any]:
     """
     Performs comprehensive static bytecode analysis for honeypot indicators:
@@ -487,8 +538,8 @@ def analyze_bytecode_honeypot(bytecode: Union[bytes, str]) -> Dict[str, Any]:
             honeypot_flags.append(f"{cat.replace('_', ' ').title()}: {sig} ({sel_hex})")
 
     # Opcode detection for EVM SELFDESTRUCT (0xff)
-    if "ff" in bytecode_hex:
-        # Check if 0xff is present as opcode outside standard push buffers
+    if has_selfdestruct_opcode(bytecode):
+        # 0xff is present as an actual opcode outside PUSH immediate operands and CBOR metadata
         if "selfdestruct" not in categories["destruct_drain"]:
             categories["destruct_drain"].append("SELFDESTRUCT opcode (0xff)")
             honeypot_flags.append("Destruct Drain: SELFDESTRUCT opcode (0xff)")

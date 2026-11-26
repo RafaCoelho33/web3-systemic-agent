@@ -29,7 +29,7 @@ except ImportError:
 
 
 async def generate_report(
-    db_path: Optional[str] = None, target_price_usd: float = 0.01
+    db_path: Optional[str] = None, target_price_usd: float = 0.015
 ) -> Dict[str, Any]:
     """
     Connects to the AgentStorage database and computes summary metrics.
@@ -56,7 +56,7 @@ def format_report_text(metrics: Dict[str, Any]) -> str:
     max_cost = metrics.get("max_cost_usd", 0.0)
     p95_cost = metrics.get("p95_cost_usd", 0.0)
 
-    target_price = metrics.get("target_price_usd", 0.01)
+    target_price = metrics.get("target_price_usd", 0.015)
     covers_max = metrics.get("price_covers_max_cost", True)
     margin_status = "PASS (Covers Max Cost)" if covers_max else "FAIL (Exceeds Target Price)"
 
@@ -128,8 +128,8 @@ def main() -> None:
     parser.add_argument(
         "--price",
         type=float,
-        default=0.01,
-        help="Target commercial price per evaluation in USD (default: 0.01)",
+        default=0.015,
+        help="Target commercial price per evaluation in USD (default: 0.015)",
     )
 
     args = parser.parse_args()

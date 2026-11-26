@@ -421,7 +421,7 @@ class WebhookAlertDispatcher:
         self,
         webhook_url: Optional[str] = None,
         public_api_url: Optional[str] = None,
-        price_usdc: float = 0.01,
+        price_usdc: float = 0.015,
         timeout: float = 10.0,
         client: Optional[httpx.AsyncClient] = None,
     ):

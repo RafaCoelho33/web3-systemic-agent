@@ -303,3 +303,28 @@ class DeepAuditRequest(BaseModel):
         return self
 
 
+class TokenCheckResponse(BaseModel):
+    address: str
+    chain_id: int = 8453
+    is_contract: bool
+    bytecode_size_bytes: int = 0
+    verdict: Literal["SAFE", "CAUTION", "DANGEROUS", "EOA"]
+    risk_score: float = Field(..., ge=0.0, le=10.0)
+    is_honeypot_suspect: bool = False
+    threat_categories: List[str] = Field(default_factory=list)
+    honeypot_flags: List[str] = Field(default_factory=list)
+    selectors_found: List[Dict[str, Any]] = Field(default_factory=list)
+    high_risk_selectors: List[str] = Field(default_factory=list)
+    is_proxy: bool = False
+    implementation_address: Optional[str] = None
+    source_verified: bool = False
+    source_provider: Optional[str] = None
+    security_warnings: List[str] = Field(default_factory=list)
+    summary: str = ""
+    deep_audit_url: str = ""
+    report_url: str = ""
+    llm_invoked: bool = False
+    payment: Optional[PaymentReceipt] = None
+
+
+

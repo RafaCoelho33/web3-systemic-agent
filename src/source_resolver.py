@@ -84,7 +84,7 @@ KNOWN_SELECTORS: Dict[str, str] = {
     "0x79cc6790": "burnFrom(address,uint256)",
     # Upgradability & Proxies
     "0x3659cfe6": "upgradeTo(address)",
-    "0x4f1f2732": "upgradeToAndCall(address,bytes)",
+    "0x4f1ef286": "upgradeToAndCall(address,bytes)",
     "0x52d19004": "implementation()",
     "0x5c60da1b": "implementation()",
     # Pausability

@@ -6,6 +6,7 @@ syntactic rule pre-validation, and two-stage pipeline execution.
 
 import asyncio
 from contextlib import asynccontextmanager
+import html
 import json
 import logging
 import os
@@ -29,8 +30,8 @@ from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse, HTMLResponse
+from pydantic import BaseModel, Field, ValidationError
 from web3 import Web3, AsyncWeb3, AsyncHTTPProvider
 
 try:
@@ -39,6 +40,7 @@ try:
         scan_recent_blocks,
         audit_discovered_contracts,
         extract_selectors_from_bytecode,
+        is_high_risk_signature,
     )
 except ImportError:
     try:
@@ -47,12 +49,22 @@ except ImportError:
             scan_recent_blocks,
             audit_discovered_contracts,
             extract_selectors_from_bytecode,
+            is_high_risk_signature,
         )
     except ImportError:
         get_latest_block_number = None
         scan_recent_blocks = None
         audit_discovered_contracts = None
         extract_selectors_from_bytecode = None
+        is_high_risk_signature = None
+
+try:
+    from scripts.dex_pool_monitor import analyze_bytecode_honeypot
+except ImportError:
+    try:
+        from dex_pool_monitor import analyze_bytecode_honeypot
+    except ImportError:
+        analyze_bytecode_honeypot = None
 
 try:
     from src.schemas import (
@@ -65,6 +77,7 @@ try:
         PreflightRequest,
         PreflightVerdict,
         DeepAuditRequest,
+        TokenCheckResponse,
     )
     from src.preflight_firewall import PreflightFirewall
     from src.source_resolver import ContractSourceResolver
@@ -89,6 +102,7 @@ try:
         build_402_response,
         build_bazaar_discovery_extension,
         QuickAuditRequest,
+        TokenCheckRequest,
         usdc_to_atomic,
     )
     from src.governance_connector import (
@@ -116,6 +130,7 @@ except ImportError:
         PreflightRequest,
         PreflightVerdict,
         DeepAuditRequest,
+        TokenCheckResponse,
     )
     from preflight_firewall import PreflightFirewall
     from source_resolver import ContractSourceResolver
@@ -140,6 +155,7 @@ except ImportError:
         build_402_response,
         build_bazaar_discovery_extension,
         QuickAuditRequest,
+        TokenCheckRequest,
         usdc_to_atomic,
     )
     from governance_connector import (
@@ -212,6 +228,29 @@ def _log_x402_settled(endpoint: str, amount_usdc: float, tx_hash: Optional[str],
     )
 
 
+def _extract_payment_header(request: Request) -> Optional[str]:
+    """Extract x402 payment header across supported header aliases."""
+    header_val = (
+        request.headers.get("x-payment")
+        or request.headers.get("payment-signature")
+        or request.headers.get("x-payment-signature")
+        or request.headers.get("X-PAYMENT")
+        or request.headers.get("PAYMENT-SIGNATURE")
+    )
+    if header_val and header_val.strip():
+        return header_val
+    return None
+
+
+def _get_public_url() -> str:
+    """Resolve the canonical public API base URL."""
+    return (
+        os.getenv("PUBLIC_API_URL")
+        or os.getenv("WEB3_AGENT_URL")
+        or "https://web3-systemic-agent.onrender.com"
+    ).rstrip("/")
+
+
 DEFAULT_BATCH_MAX_ITEMS = 50
 
 
@@ -235,11 +274,11 @@ def get_batch_max_items() -> int:
 
 class ServiceDiscoveryResponse(BaseModel):
     service: str = Field(default="Web3 Condition-Action Trigger Agent", description="Service identifier")
-    version: str = Field(default="1.0.0", description="Application semantic version")
+    version: str = Field(default="1.0.2", description="Application semantic version")
     status: str = Field(default="online", description="Operational status of the service")
     x402_enabled: bool = Field(default=False, description="Whether x402 payment gate is enabled")
     x402_network: Optional[str] = Field(default=None, description="Active x402 CAIP-2 network")
-    price_per_eval_usdc: float = Field(default=0.01, description="Base price in USDC per evaluation")
+    price_per_eval_usdc: float = Field(default=0.015, description="Base price in USDC per evaluation")
     pay_to_address: Optional[str] = Field(default=None, description="Recipient EVM address for x402 micropayments")
     endpoints: Dict[str, str] = Field(..., description="Canonical API endpoint route registry")
 
@@ -250,7 +289,7 @@ class SimpleHealthResponse(BaseModel):
 
 class HealthCheckResponse(BaseModel):
     status: str = Field(..., description="Overall health status: 'ok', 'degraded', or 'error'")
-    version: str = Field(default="1.0.0", description="Application version")
+    version: str = Field(default="1.0.2", description="Application version")
     timestamp: str = Field(..., description="ISO 8601 UTC timestamp of inspection")
     rpc_status: Dict[int, bool] = Field(..., description="RPC connectivity per chain ID")
     semantic_provider: str = Field(..., description="Active semantic provider ('gemini', 'openai', or 'mock')")
@@ -259,7 +298,7 @@ class HealthCheckResponse(BaseModel):
     model: Optional[str] = Field(default=None, description="Active model name if using Gemini or OpenAI")
     x402_enabled: bool = Field(default=False, description="Whether x402 payment gate is enabled")
     x402_network: Optional[str] = Field(default=None, description="Active x402 CAIP-2 network")
-    price_per_eval_usdc: float = Field(default=0.01, description="Base price in USDC per evaluation")
+    price_per_eval_usdc: float = Field(default=0.015, description="Base price in USDC per evaluation")
 
 
 class ValidationDetail(BaseModel):
@@ -305,6 +344,18 @@ async def _background_scanner_worker(app_instance: FastAPI):
     require_high_risk_str = os.getenv("SCANNER_REQUIRE_HIGH_RISK_FOR_LLM", "true").strip().lower()
     require_high_risk = require_high_risk_str in ("true", "1", "yes")
 
+    raw_channels = os.getenv(
+        "HUNTER_CHANNELS",
+        "dex_pools,geckoterminal_base,dexscreener_base,snapshot_daos",
+    )
+    hunter_channels = [c.strip() for c in raw_channels.split(",") if c.strip()] or [
+        "dex_pools",
+        "geckoterminal_base",
+        "dexscreener_base",
+        "snapshot_daos",
+    ]
+    hunter_channel_idx = 0
+
     logger.info("Background block contract scanner worker started on Base Mainnet (%s)", rpc_url)
     try:
         while True:
@@ -347,6 +398,43 @@ async def _background_scanner_worker(app_instance: FastAPI):
 
                 last_scanned_block = current_block
 
+                # Optional multi-channel autonomous discovery hunter (1 rotating channel per cycle)
+                enable_hunter = (
+                    os.getenv("ENABLE_MULTI_CHANNEL_HUNTER", "true").strip().lower()
+                    in ("true", "1", "yes")
+                )
+                if getattr(app_instance.state, "scanner_w3", None) is None and enable_hunter:
+                    try:
+                        from src.discovery_hunter import ActiveContractHunter  # lazy import
+
+                        channel = hunter_channels[hunter_channel_idx % len(hunter_channels)]
+                        hunter_channel_idx += 1
+                        active_eng = getattr(app_instance.state, "engine", None)
+                        active_storage = getattr(app_instance.state, "storage", None)
+                        hunter = getattr(app_instance.state, "discovery_hunter", None)
+                        if hunter is None:
+                            try:
+                                hunter = ActiveContractHunter(
+                                    engine=active_eng,
+                                    storage=active_storage,
+                                    rpc_url=rpc_url,
+                                    require_high_risk_for_llm=require_high_risk,
+                                )
+                            except TypeError:
+                                hunter = ActiveContractHunter(engine=active_eng, rpc_url=rpc_url)
+                            app_instance.state.discovery_hunter = hunter
+                        if hasattr(hunter, "run_hunt_cycle"):
+                            await hunter.run_hunt_cycle(
+                                channels=[channel],
+                                limit_per_channel=limit,
+                            )
+                        elif hasattr(hunter, "run_channel"):
+                            await hunter.run_channel(channel, limit_per_channel=limit)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as hunter_exc:
+                        logger.debug("Multi-channel hunter cycle skipped: %s", hunter_exc)
+
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -377,6 +465,9 @@ Allow: /evaluate
 Allow: /audit
 Allow: /preflight
 Allow: /audit/deep
+Allow: /token/check
+Allow: /feed/recent
+Allow: /report/
 Allow: /rules/validate
 Allow: /llms.txt
 Allow: /llms-full.txt
@@ -395,6 +486,9 @@ Allow: /evaluate
 Allow: /audit
 Allow: /preflight
 Allow: /audit/deep
+Allow: /token/check
+Allow: /feed/recent
+Allow: /report/
 Allow: /rules/validate
 Allow: /llms.txt
 Allow: /llms-full.txt
@@ -413,6 +507,9 @@ Allow: /evaluate
 Allow: /audit
 Allow: /preflight
 Allow: /audit/deep
+Allow: /token/check
+Allow: /feed/recent
+Allow: /report/
 Allow: /rules/validate
 Allow: /llms.txt
 Allow: /llms-full.txt
@@ -431,6 +528,9 @@ Allow: /evaluate
 Allow: /audit
 Allow: /preflight
 Allow: /audit/deep
+Allow: /token/check
+Allow: /feed/recent
+Allow: /report/
 Allow: /rules/validate
 Allow: /llms.txt
 Allow: /llms-full.txt
@@ -449,6 +549,9 @@ Allow: /evaluate
 Allow: /audit
 Allow: /preflight
 Allow: /audit/deep
+Allow: /token/check
+Allow: /feed/recent
+Allow: /report/
 Allow: /rules/validate
 Allow: /llms.txt
 Allow: /llms-full.txt
@@ -460,11 +563,11 @@ Disallow: /payments
 Disallow: /jobs/
 """
 
-SECURITY_TXT_CONTENT = """Contact: https://github.com/RafaCoelho33/web3_systemic-agent/issues
+SECURITY_TXT_CONTENT = """Contact: https://github.com/RafaCoelho33/web3-systemic-agent/issues
 Expires: 2027-12-31T23:59:59.000Z
 Preferred-Languages: en, pt
 Canonical: https://web3-systemic-agent.onrender.com/.well-known/security.txt
-Policy: https://github.com/RafaCoelho33/web3_systemic-agent/blob/main/README.md
+Policy: https://github.com/RafaCoelho33/web3-systemic-agent/blob/main/README.md
 """
 
 ICON_SVG_CONTENT = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
@@ -488,10 +591,37 @@ ICON_SVG_CONTENT = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 1
 LLMS_TXT_CONTENT = """# Web3 Systemic Agent (io.github.RafaCoelho33/web3-systemic-agent)
 > Autonomous Web3 Security & Governance Auditor with Two-Stage Hybrid LLM Pipeline & x402 Bazaar Micropayments.
 
+- **Version:** `1.0.2`
+- **Public API URL:** `https://web3-systemic-agent.onrender.com`
+- **Supported Chains:** Base Mainnet (`eip155:8453`), Base Sepolia (`eip155:84532`), Arbitrum One (`eip155:42161`)
+- **Full Documentation:** `/llms-full.txt`
+
+## MCP Streamable-HTTP (`POST /mcp`)
+- `scan_contract_selectors` (Free): Extracts 4-byte EVM selectors and flags admin backdoors.
+- `check_token_honeypot` (Free): Static bytecode scanner for honeypots, sell-tax modifiers, and blacklists.
+- `scan_dao_proposals` (Free): Ingests Snapshot DAO proposals and extracts on-chain execution payloads.
+- `deep_semantic_audit` (Paid via x402: `$0.015` USDC standard / `$0.25` USDC deep proxy + verified source): Two-stage deterministic gatekeeping + Gemini LLM semantic audit.
+
+## REST API & x402 Pricing (Base Mainnet USDC)
+- `POST /rules/validate` (Free): Static payload pre-validation.
+- `GET` / `POST /token/check` (`$0.005` USDC via x402): Fast deterministic token safety & honeypot check (bytecode honeypot, proxy & Sourcify verification).
+- `POST /preflight` (`$0.01` USDC via x402): Pre-sign EVM transaction firewall, simulation & prompt injection defense.
+- `POST /evaluate` (`$0.015` USDC via x402): Full rule evaluation with Stage 1 gatekeeping + Stage 2 Gemini LLM.
+- `POST /audit` (`$0.015` USDC via x402): Quick contract & calldata audit.
+- `POST /audit/deep` (`$0.25` USDC via x402): Deep EIP-1967/1822 proxy resolution & verified Solidity source audit.
+
+## Discovery & Ownership
+- `GET /.well-known/x402` | `GET /.well-known/mcp/server-card.json` | `GET /.well-known/agent.json` | `GET /.well-known/owners.json` | `GET /.well-known/security.txt`
+- **Contact:** https://github.com/RafaCoelho33/web3-systemic-agent/issues
+"""
+
+LLMS_FULL_TXT_CONTENT = """# Web3 Systemic Agent (io.github.RafaCoelho33/web3-systemic-agent)
+> Autonomous Web3 Security & Governance Auditor with Two-Stage Hybrid LLM Pipeline & x402 Bazaar Micropayments.
+
 ## System Overview
 - **System Identifier:** `io.github.RafaCoelho33/web3-systemic-agent`
 - **Name:** Web3 Systemic Agent
-- **Version:** `1.0.0`
+- **Version:** `1.0.2`
 - **Public API URL:** `https://web3-systemic-agent.onrender.com`
 - **Supported Chains:** Base Mainnet (`eip155:8453`), Base Sepolia (`eip155:84532`), Arbitrum One (`eip155:42161`)
 
@@ -500,14 +630,14 @@ LLMS_TXT_CONTENT = """# Web3 Systemic Agent (io.github.RafaCoelho33/web3-systemi
    - High-throughput EVM bytecode and calldata analysis using `ChainInspector` with local FIFO caching.
    - Extracts 4-byte function selectors, inspects target contract bytecode existence, verifies native balances, and evaluates DEX honeypot signatures.
    - Short-circuits non-matching or benign conditions with `llm_invoked=False` ($0.00 LLM token cost).
-2. **Stage 2: Deep Semantic LLM Governance & Security Audit ($0.05 USDC via x402)**
+2. **Stage 2: Deep Semantic LLM Governance & Security Audit ($0.015 USDC standard / $0.25 USDC deep proxy + verified source via x402)**
    - Triggered only when Stage 1 deterministic conditions pass or high-risk administrative capabilities are detected.
    - Leverages Google Gemini (`gemini-3.5-flash-lite` with automatic cooldown failover to `gemini-3.1-flash-lite`, `gemini-2.5-flash-lite`, and `gemini-2.0-flash`).
    - Evaluates natural language claims against actual on-chain bytecode, native balance, and execution calldata.
    - Enforces deterministic policy escalation (`APPROVE`, `MANUAL_REVIEW`, `REJECT`) via `enforce_decision_policy`.
 
 ## Model Context Protocol (MCP) Streamable-HTTP (`POST /mcp`)
-Connect using MCP specification `2024-11-05` via HTTP POST:
+Connect using MCP specification (`2024-11-05`, `2025-03-26`, `2025-06-18`) via HTTP POST:
 - **Endpoint:** `POST https://web3-systemic-agent.onrender.com/mcp`
 - **Headers:** `Content-Type: application/json`
 
@@ -522,7 +652,7 @@ Connect using MCP specification `2024-11-05` via HTTP POST:
   "params": {
     "protocolVersion": "2024-11-05",
     "capabilities": {},
-    "clientInfo": {"name": "autonomous-client", "version": "1.0.0"}
+    "clientInfo": {"name": "autonomous-client", "version": "1.0.2"}
   }
 }
 ```
@@ -575,7 +705,7 @@ Connect using MCP specification `2024-11-05` via HTTP POST:
   - `limit` (integer, default 3): Number of proposals to fetch.
   - `use_curated_offline` (boolean, default false): If true, returns verified offline curated proposals.
 
-### 4. `deep_semantic_audit` (Stage 2 Paid - $0.05 USDC via x402)
+### 4. `deep_semantic_audit` (Stage 2 Paid - $0.015 USDC standard / $0.25 USDC deep proxy + verified source via x402)
 - **Description:** Two-stage security audit crossing natural language proposal text with on-chain bytecode and calldata. Returns risk scores (0.0 to 10.0), flagged issues, and deterministic policy action (`APPROVE`, `MANUAL_REVIEW`, `REJECT`).
 - **Arguments:**
   - `target_address` (string, required): Smart contract address under evaluation.
@@ -584,7 +714,9 @@ Connect using MCP specification `2024-11-05` via HTTP POST:
   - `calldata` (string, default "0x"): Hex calldata being executed.
   - `chain_id` (integer, default 8453): EVM Chain ID.
   - `risk_threshold` (number, default 7.0): Risk threshold.
-  - `x402_payment_header` (string, optional): Base64 EIP-3009 transfer authorization.
+  - `resolve_proxy` (boolean, default false): Resolve EIP-1967/1822 proxy implementation ($0.25 tier).
+  - `fetch_verified_source` (boolean, default false): Fetch verified Solidity source code ($0.25 tier).
+  - `x402_payment_header` (string, optional): Base64 EIP-3009 transfer authorization (or pass `X-PAYMENT` / `PAYMENT-SIGNATURE` HTTP header).
 - **Payment Requirement:** If called without `x402_payment_header` or configured buyer key, returns HTTP 402 with recipient address `0x2b7F1fd931f7f28f89e0f688Dd5Bb7a620c24b63` on Base Mainnet (`eip155:8453`).
 
 ## REST API Integration
@@ -593,7 +725,17 @@ Connect using MCP specification `2024-11-05` via HTTP POST:
 - **Endpoint:** `POST https://web3-systemic-agent.onrender.com/rules/validate`
 - Validates payload structure and parameters before submission.
 
-### Deep Evaluation Execution ($0.05 USDC via x402)
+### Token Safety Check ($0.005 USDC via x402)
+- **Endpoint:** `GET` or `POST https://web3-systemic-agent.onrender.com/token/check`
+- **Headers:** `X-PAYMENT: <base64_eip3009_auth>`
+- **Request Body / Query Params:** `TokenCheckRequest` (`address` / `token` / `token_address`, `chain_id`, `include_source_status`) -> returns `TokenCheckResponse` (`verdict`, `risk_score`, `is_honeypot_suspect`, `honeypot_flags`, `selectors_found`, `high_risk_selectors`, `is_proxy`, `source_verified`) with zero LLM cost (`llm_invoked: false`).
+
+### Preflight Transaction Security Firewall ($0.01 USDC via x402)
+- **Endpoint:** `POST https://web3-systemic-agent.onrender.com/preflight`
+- **Headers:** `X-PAYMENT: <base64_eip3009_auth>`
+- **Request Body:** `PreflightRequest` (`to_address`, `calldata`, `value_wei`, `chain_id`, `eip712_typed_data`, `untrusted_text`, `run_simulation`)
+
+### Deep Evaluation Execution ($0.015 USDC via x402)
 - **Endpoint:** `POST https://web3-systemic-agent.onrender.com/evaluate`
 - **Headers:** `X-PAYMENT: <base64_eip3009_auth>`
 
@@ -620,7 +762,7 @@ Connect using MCP specification `2024-11-05` via HTTP POST:
 }
 ```
 
-### Simplified Quick Contract Audit ($0.05 USDC via x402)
+### Simplified Quick Contract Audit ($0.015 USDC via x402)
 - **Endpoint:** `POST https://web3-systemic-agent.onrender.com/audit`
 - **Headers:** `X-PAYMENT: <base64_eip3009_auth>`
 - **Request Body:** `QuickAuditRequest` (`target_address`, `chain_id`, `proposal_description`, `calldata`, `policy_prompt`, `risk_threshold`)
@@ -635,11 +777,6 @@ Connect using MCP specification `2024-11-05` via HTTP POST:
 }
 ```
 
-### Preflight Transaction Security Firewall ($0.01 USDC via x402)
-- **Endpoint:** `POST https://web3-systemic-agent.onrender.com/preflight`
-- **Headers:** `X-PAYMENT: <base64_eip3009_auth>`
-- **Request Body:** `PreflightRequest` (`to_address`, `calldata`, `value_wei`, `chain_id`, `eip712_typed_data`, `untrusted_text`, `run_simulation`)
-
 ### Deep Source & Proxy Smart Contract Audit ($0.25 USDC via x402)
 - **Endpoint:** `POST https://web3-systemic-agent.onrender.com/audit/deep`
 - **Headers:** `X-PAYMENT: <base64_eip3009_auth>`
@@ -647,14 +784,861 @@ Connect using MCP specification `2024-11-05` via HTTP POST:
 
 ### x402 Bazaar Protocol Discovery
 - **Endpoint:** `GET https://web3-systemic-agent.onrender.com/.well-known/x402`
-- Returns official x402 v2 service discovery metadata and resource specifications for `/evaluate`, `/audit`, `/preflight`, and `/audit/deep`.
+- Returns official x402 v2 service discovery metadata and resource specifications for `/evaluate`, `/audit`, `/preflight`, `/audit/deep`, and `/token/check`.
 
 ## Security & Transparency
 - **Security Policy:** `/.well-known/security.txt`
 - **MCP Server Card:** `/.well-known/mcp/server-card.json`
 - **Agent Card:** `/.well-known/agent.json`
-- **Contact:** https://github.com/RafaCoelho33/web3_systemic-agent/issues
+- **Owners Manifest:** `/.well-known/owners.json`
+- **Contact:** https://github.com/RafaCoelho33/web3-systemic-agent/issues
 """
+
+
+# -------------------------------------------------------------------------
+# Wave 3B: HTML Landing Page, Public Feed & Shareable Reports Helpers
+# -------------------------------------------------------------------------
+
+_CHAIN_NAMES: Dict[int, str] = {
+    1: "Ethereum Mainnet",
+    8453: "Base Mainnet",
+    84532: "Base Sepolia",
+    42161: "Arbitrum One",
+    10: "Optimism",
+    137: "Polygon",
+}
+
+
+def _chain_display_name(chain_id: int) -> str:
+    """Return human-readable EVM network name for a numeric chain ID."""
+    return _CHAIN_NAMES.get(chain_id, f"EVM Chain {chain_id}")
+
+
+def _short_address(address: str) -> str:
+    """Shorten a 42-char EVM address to 0x1234...abcd format."""
+    if len(address) >= 12:
+        return f"{address[:6]}...{address[-4:]}"
+    return address
+
+
+def _wants_html_response(request: Request, format_param: Optional[str] = None) -> bool:
+    """
+    Determine whether to serve HTML via explicit ?format=html override or Accept header negotiation.
+    Programmatic clients sending */* or application/json always receive JSON.
+    """
+    if format_param is not None:
+        fmt = format_param.strip().lower()
+        if fmt == "html":
+            return True
+        if fmt == "json":
+            return False
+    accept = request.headers.get("accept", "").lower()
+    return ("text/html" in accept) and ("application/json" not in accept)
+
+
+def _extract_target_address_from_row(row: Dict[str, Any]) -> Optional[str]:
+    """Extract target EVM address from a stored evaluation row's request_json."""
+    raw_req = row.get("request_json")
+    if not raw_req:
+        return None
+    if isinstance(raw_req, str):
+        try:
+            req_data = json.loads(raw_req)
+        except (ValueError, TypeError):
+            return None
+    elif isinstance(raw_req, dict):
+        req_data = raw_req
+    else:
+        return None
+
+    if not isinstance(req_data, dict):
+        return None
+
+    deterministic = req_data.get("deterministic")
+    if isinstance(deterministic, dict) and deterministic.get("target_address"):
+        return str(deterministic["target_address"])
+
+    ctx_meta = req_data.get("context_metadata")
+    if isinstance(ctx_meta, dict) and ctx_meta.get("contract_address"):
+        return str(ctx_meta["contract_address"])
+
+    for fallback_key in ("target_address", "contract_address", "token_address"):
+        if req_data.get(fallback_key):
+            return str(req_data[fallback_key])
+    return None
+
+
+def _build_feed_item(row: Dict[str, Any], public_url: str) -> Dict[str, Any]:
+    """Normalize a storage evaluation row into a public /feed/recent item."""
+    chain_id = row.get("chain_id")
+    target_address = _extract_target_address_from_row(row)
+    report_url = (
+        f"{public_url}/report/{chain_id}/{target_address}"
+        if (chain_id is not None and target_address)
+        else None
+    )
+    token_check_url = (
+        f"{public_url}/token/check?address={target_address}&chain_id={chain_id}"
+        if (chain_id is not None and target_address)
+        else None
+    )
+    stage1_val = row.get("stage1_passed")
+    llm_val = row.get("llm_invoked")
+    return {
+        "rule_id": row.get("rule_id"),
+        "chain_id": chain_id,
+        "target_address": target_address,
+        "source": row.get("source"),
+        "stage1_passed": bool(stage1_val) if stage1_val is not None else None,
+        "llm_invoked": bool(llm_val) if llm_val is not None else None,
+        "decision": row.get("decision"),
+        "risk_score": row.get("risk_score"),
+        "created_at": row.get("created_at"),
+        "report_url": report_url,
+        "token_check_x402_url": token_check_url,
+        "deep_audit_x402_url": f"{public_url}/audit/deep",
+    }
+
+
+def _resolve_report_badge(
+    evaluated: bool,
+    latest_decision: Optional[str],
+    risk_score: Optional[float],
+    honeypot_analysis: Optional[Dict[str, Any]],
+) -> tuple:
+    """Resolve verdict badge label, accent hex color, and tint background."""
+    dec_upper = (latest_decision or "").strip().upper()
+    is_hp = bool(honeypot_analysis and honeypot_analysis.get("is_honeypot"))
+    if dec_upper == "REJECT" or (risk_score is not None and float(risk_score) >= 7.0) or is_hp:
+        return ("HIGH RISK / REJECT", "#FF4D4F", "rgba(255,77,79,0.16)")
+    if dec_upper in ("MANUAL_REVIEW", "CAUTION") or (risk_score is not None and float(risk_score) >= 4.0):
+        return ("CAUTION / MANUAL_REVIEW", "#FAAD14", "rgba(250,173,20,0.16)")
+    if evaluated or (risk_score is not None and float(risk_score) < 4.0):
+        return ("VERIFIED / SAFE", "#00D26A", "rgba(0,210,106,0.16)")
+    return ("UNSCANNED — READY FOR AUDIT", "#00D2FF", "rgba(0,210,255,0.16)")
+
+
+async def _build_contract_report_context(
+    app_instance: FastAPI,
+    chain_id: int,
+    checksum_addr: str,
+) -> Dict[str, Any]:
+    """Assemble contract security report context from storage feed history and ChainInspector cache."""
+    public_url = _get_public_url()
+    storage_inst: Optional[AgentStorage] = getattr(app_instance.state, "storage", None)
+
+    latest_row: Optional[Dict[str, Any]] = None
+    if storage_inst is not None and hasattr(storage_inst, "get_recent_feed_evaluations"):
+        rows = await storage_inst.get_recent_feed_evaluations(limit=50)
+        target_lower = checksum_addr.lower()
+        for row in rows:
+            row_chain = row.get("chain_id")
+            if row_chain is None or int(row_chain) != chain_id:
+                continue
+            row_addr = _extract_target_address_from_row(row)
+            if row_addr and row_addr.lower() == target_lower:
+                latest_row = row
+                break
+
+    cache_key = f"{chain_id}:{checksum_addr}"
+    code_bytes = ChainInspector._bytecode_cache.get(cache_key)
+    if code_bytes is None:
+        code_bytes = ChainInspector._bytecode_cache.get(f"{chain_id}:{checksum_addr.lower()}")
+
+    bytecode_cached = bool(code_bytes and code_bytes not in (b"", b"\x00"))
+    bytecode_size_bytes = len(code_bytes) if bytecode_cached and code_bytes is not None else 0
+    honeypot_analysis: Optional[Dict[str, Any]] = None
+    selectors_count = 0
+    high_risk_signatures: List[str] = []
+
+    if bytecode_cached and code_bytes is not None:
+        if analyze_bytecode_honeypot is not None:
+            honeypot_analysis = analyze_bytecode_honeypot(code_bytes)
+        if extract_selectors_from_bytecode is not None:
+            extracted = extract_selectors_from_bytecode(code_bytes)
+            selectors_count = len(extracted)
+            if is_high_risk_signature is not None:
+                high_risk_signatures = [
+                    str(s.get("signature", ""))
+                    for s in extracted
+                    if is_high_risk_signature(str(s.get("signature", "")))
+                ]
+
+    evaluated = latest_row is not None
+    latest_decision = latest_row.get("decision") if latest_row else None
+    risk_score = latest_row.get("risk_score") if latest_row else None
+    rule_id = latest_row.get("rule_id") if latest_row else None
+    source = latest_row.get("source") if latest_row else None
+    created_at = latest_row.get("created_at") if latest_row else None
+    stage1_passed = (
+        bool(latest_row["stage1_passed"])
+        if latest_row and latest_row.get("stage1_passed") is not None
+        else None
+    )
+    llm_invoked = (
+        bool(latest_row["llm_invoked"])
+        if latest_row and latest_row.get("llm_invoked") is not None
+        else None
+    )
+
+    badge_label, badge_color, badge_bg = _resolve_report_badge(
+        evaluated=evaluated,
+        latest_decision=latest_decision,
+        risk_score=risk_score,
+        honeypot_analysis=honeypot_analysis,
+    )
+
+    return {
+        "address": checksum_addr,
+        "short_address": _short_address(checksum_addr),
+        "chain_id": chain_id,
+        "chain_name": _chain_display_name(chain_id),
+        "evaluated": evaluated,
+        "latest_decision": latest_decision,
+        "risk_score": risk_score,
+        "rule_id": rule_id,
+        "source": source,
+        "stage1_passed": stage1_passed,
+        "llm_invoked": llm_invoked,
+        "created_at": created_at,
+        "bytecode_cached": bytecode_cached,
+        "bytecode_size_bytes": bytecode_size_bytes,
+        "selectors_count": selectors_count,
+        "high_risk_signatures": high_risk_signatures,
+        "honeypot_analysis": honeypot_analysis,
+        "verdict_badge": badge_label,
+        "badge_color": badge_color,
+        "badge_bg": badge_bg,
+        "report_url": f"{public_url}/report/{chain_id}/{checksum_addr}",
+        "card_svg_url": f"{public_url}/report/{chain_id}/{checksum_addr}/card.svg",
+        "token_check_x402_url": f"{public_url}/token/check?address={checksum_addr}&chain_id={chain_id}",
+        "audit_x402_url": f"{public_url}/audit",
+        "deep_audit_x402_url": f"{public_url}/audit/deep",
+    }
+
+
+def _build_report_svg(report_ctx: Dict[str, Any]) -> str:
+    """Render a 1200x630 OpenGraph SVG security card for a contract report."""
+    short_addr = html.escape(str(report_ctx["short_address"]), quote=True)
+    full_addr = html.escape(str(report_ctx["address"]), quote=True)
+    chain_id = int(report_ctx["chain_id"])
+    chain_name = html.escape(str(report_ctx["chain_name"]), quote=True)
+    badge_label = html.escape(str(report_ctx["verdict_badge"]), quote=True)
+    badge_color = html.escape(str(report_ctx["badge_color"]), quote=True)
+    badge_bg = html.escape(str(report_ctx["badge_bg"]), quote=True)
+
+    risk_score = report_ctx.get("risk_score")
+    score_text = f"{float(risk_score):.1f} / 10" if risk_score is not None else "Pending"
+    decision_text = html.escape(str(report_ctx.get("latest_decision") or "UNSCANNED"), quote=True)
+    cache_text = (
+        f"Cached ({report_ctx.get('bytecode_size_bytes', 0)} bytes)"
+        if report_ctx.get("bytecode_cached")
+        else "On-Demand RPC"
+    )
+    cache_text_esc = html.escape(cache_text, quote=True)
+
+    return f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#07090E" />
+      <stop offset="100%" stop-color="#0E1422" />
+    </linearGradient>
+    <linearGradient id="brandGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#0052FF" />
+      <stop offset="100%" stop-color="#00D2FF" />
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bgGrad)" />
+  <rect x="36" y="36" width="1128" height="558" rx="24" fill="#0D111A" stroke="#1E293B" stroke-width="2" />
+  <rect x="36" y="36" width="1128" height="6" rx="3" fill="url(#brandGrad)" />
+
+  <g transform="translate(80, 82)">
+    <path d="M24 0 L48 10 C48 34 30 50 24 55 C18 50 0 34 0 10 Z" fill="#0052FF" />
+    <path d="M16 27 L22 33 L33 20" fill="none" stroke="#FFFFFF" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" />
+    <text x="66" y="25" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="26" font-weight="700" fill="#F8FAFC">Web3 Systemic Agent</text>
+    <text x="66" y="50" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="16" fill="#94A3B8">Autonomous EVM Security Firewall • MCP Server • x402 Auditor</text>
+  </g>
+
+  <rect x="740" y="84" width="380" height="52" rx="26" fill="{badge_bg}" stroke="{badge_color}" stroke-width="2" />
+  <text x="930" y="117" text-anchor="middle" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="19" font-weight="700" fill="{badge_color}">{badge_label}</text>
+
+  <text x="80" y="210" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="18" font-weight="600" fill="#64748B">TARGET CONTRACT REPORT</text>
+  <text x="80" y="268" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="48" font-weight="700" fill="#FFFFFF">{short_addr}</text>
+  <text x="80" y="312" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="22" fill="#94A3B8">{full_addr}</text>
+
+  <rect x="80" y="360" width="320" height="118" rx="14" fill="#131926" stroke="#1E293B" stroke-width="1.5" />
+  <text x="104" y="396" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="15" fill="#64748B">NETWORK / CHAIN ID</text>
+  <text x="104" y="432" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="24" font-weight="700" fill="#F8FAFC">{chain_name}</text>
+  <text x="104" y="458" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" fill="#38BDF8">eip155:{chain_id}</text>
+
+  <rect x="440" y="360" width="320" height="118" rx="14" fill="#131926" stroke="#1E293B" stroke-width="1.5" />
+  <text x="464" y="396" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="15" fill="#64748B">VERDICT &amp; RISK SCORE</text>
+  <text x="464" y="432" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="24" font-weight="700" fill="{badge_color}">{decision_text}</text>
+  <text x="464" y="458" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" fill="#CBD5E1">Risk Score: {html.escape(score_text, quote=True)}</text>
+
+  <rect x="800" y="360" width="320" height="118" rx="14" fill="#131926" stroke="#1E293B" stroke-width="1.5" />
+  <text x="824" y="396" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="15" fill="#64748B">STATIC BYTECODE CACHE</text>
+  <text x="824" y="432" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="22" font-weight="700" fill="#F8FAFC">{cache_text_esc}</text>
+  <text x="824" y="458" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" fill="#94A3B8">Selectors: {int(report_ctx.get("selectors_count", 0))}</text>
+
+  <line x1="80" y1="518" x2="1120" y2="518" stroke="#1E293B" stroke-width="1.5" />
+  <text x="80" y="556" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="18" font-weight="600" fill="#38BDF8">$0.005 Quick Check  •  $0.015 AI Audit  •  $0.25 Deep Source</text>
+  <text x="1120" y="556" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" fill="#64748B">x402 Micropayments on Base</text>
+</svg>"""
+
+
+def _build_report_html(report_ctx: Dict[str, Any], public_url: str) -> str:
+    """Render shareable HTML contract report with OpenGraph/Twitter tags and live Stage-1 runner."""
+    addr = html.escape(str(report_ctx["address"]), quote=True)
+    short_addr = html.escape(str(report_ctx["short_address"]), quote=True)
+    chain_id = int(report_ctx["chain_id"])
+    chain_name = html.escape(str(report_ctx["chain_name"]), quote=True)
+    badge_label = html.escape(str(report_ctx["verdict_badge"]), quote=True)
+    badge_color = html.escape(str(report_ctx["badge_color"]), quote=True)
+    badge_bg = html.escape(str(report_ctx["badge_bg"]), quote=True)
+    card_svg_url = html.escape(str(report_ctx["card_svg_url"]), quote=True)
+    report_url = html.escape(str(report_ctx["report_url"]), quote=True)
+
+    decision_str = html.escape(str(report_ctx.get("latest_decision") or "UNSCANNED"), quote=True)
+    risk_val = report_ctx.get("risk_score")
+    risk_str = f"{float(risk_val):.2f} / 10" if risk_val is not None else "Not yet scored"
+    source_str = html.escape(str(report_ctx.get("source") or "on-demand"), quote=True)
+    created_str = html.escape(str(report_ctx.get("created_at") or "—"), quote=True)
+    og_desc = html.escape(
+        f"Security status for {report_ctx['short_address']} on {report_ctx['chain_name']}: "
+        f"{report_ctx['verdict_badge']}. Inspect selectors, honeypot traps, or run a paid x402 deep audit.",
+        quote=True,
+    )
+
+    hp_flags = []
+    if isinstance(report_ctx.get("honeypot_analysis"), dict):
+        hp_flags = report_ctx["honeypot_analysis"].get("honeypot_flags") or []
+    flags_items = "".join(
+        f"<li>{html.escape(str(flag), quote=True)}</li>" for flag in hp_flags
+    ) or "<li>No static honeypot flags cached yet. Run Live Stage-1 Scan below.</li>"
+
+    high_risk_sigs = report_ctx.get("high_risk_signatures") or []
+    sig_items = "".join(
+        f"<li><code>{html.escape(str(sig), quote=True)}</code></li>" for sig in high_risk_sigs
+    ) or "<li>No cached high-risk administrative selectors.</li>"
+
+    curl_token_check = html.escape(
+        f'curl -X POST "{public_url}/token/check" -H "Content-Type: application/json" '
+        f'-d \'{{"token_address": "{report_ctx["address"]}", "chain_id": {chain_id}}}\'',
+        quote=True,
+    )
+    curl_deep_audit = html.escape(
+        f'curl -X POST "{public_url}/audit/deep" -H "Content-Type: application/json" '
+        f'-d \'{{"target_address": "{report_ctx["address"]}", "chain_id": {chain_id}, '
+        f'"resolve_proxy": true, "fetch_verified_source": true}}\'',
+        quote=True,
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Security Report {short_addr} ({chain_name}) — Web3 Systemic Agent</title>
+  <meta property="og:title" content="Web3 Systemic Agent — {short_addr} ({chain_name})" />
+  <meta property="og:description" content="{og_desc}" />
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content="{report_url}" />
+  <meta property="og:image" content="{card_svg_url}" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Web3 Systemic Agent — {short_addr} ({chain_name})" />
+  <meta name="twitter:description" content="{og_desc}" />
+  <meta name="twitter:image" content="{card_svg_url}" />
+  <style>
+    :root {{ --bg:#0A0B0D; --panel:#111318; --border:#1E2430; --text:#F8FAFC; --muted:#94A3B8; --blue:#0052FF; --cyan:#00D2FF; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--text); line-height:1.5; }}
+    .wrap {{ max-width:980px; margin:0 auto; padding:28px 20px 64px; }}
+    .nav {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:24px; gap:12px; flex-wrap:wrap; }}
+    .nav a {{ color:var(--cyan); text-decoration:none; font-weight:600; }}
+    .badge {{ display:inline-block; padding:6px 14px; border-radius:999px; font-weight:700; font-size:13px; color:{badge_color}; background:{badge_bg}; border:1px solid {badge_color}; }}
+    .card-img {{ width:100%; border-radius:16px; border:1px solid var(--border); display:block; margin:16px 0 24px; }}
+    .grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; margin-bottom:24px; }}
+    .box {{ background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:18px; }}
+    .lbl {{ font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin-bottom:6px; }}
+    .val {{ font-size:18px; font-weight:700; word-break:break-all; }}
+    .mono {{ font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:13px; }}
+    .btn {{ background:var(--blue); color:#fff; border:none; border-radius:10px; padding:11px 18px; font-weight:700; cursor:pointer; font-size:14px; }}
+    .btn:hover {{ background:#1652F0; }}
+    pre {{ background:#07090D; border:1px solid var(--border); padding:12px; border-radius:10px; overflow-x:auto; font-size:12px; color:#E2E8F0; }}
+    ul {{ margin:8px 0 0 18px; color:var(--muted); }}
+    #live-out {{ margin-top:16px; display:none; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="nav">
+      <a href="/?format=html">← Web3 Systemic Agent Playground</a>
+      <span class="badge">{badge_label}</span>
+    </div>
+    <h1 style="margin:0 0 6px;">Contract Security Report</h1>
+    <div class="mono" style="color:var(--muted);">{addr} • {chain_name} (eip155:{chain_id})</div>
+
+    <img class="card-img" src="/report/{chain_id}/{addr}/card.svg" alt="Contract Security Card for {short_addr}" />
+
+    <div class="grid">
+      <div class="box"><div class="lbl">Latest Verdict</div><div class="val">{decision_str}</div></div>
+      <div class="box"><div class="lbl">Risk Score</div><div class="val">{html.escape(risk_str, quote=True)}</div></div>
+      <div class="box"><div class="lbl">Discovery Source</div><div class="val">{source_str}</div></div>
+      <div class="box"><div class="lbl">Last Evaluated</div><div class="val mono">{created_str}</div></div>
+    </div>
+
+    <div class="box" style="margin-bottom:20px;">
+      <div class="lbl">Static Bytecode &amp; Selector Signals (Cached: {str(report_ctx.get("bytecode_cached")).lower()})</div>
+      <ul>{flags_items}</ul>
+      <div class="lbl" style="margin-top:14px;">High-Risk Admin Selectors</div>
+      <ul>{sig_items}</ul>
+    </div>
+
+    <div class="box" style="margin-bottom:20px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
+        <div>
+          <div class="lbl">Free On-Demand Verification</div>
+          <div style="font-weight:700;">Run Live Stage-1 MCP Scan (Honeypot + Selectors)</div>
+        </div>
+        <button id="run-scan-btn" class="btn" type="button">Run Live Stage-1 Scan ($0.00)</button>
+      </div>
+      <div id="live-out" class="box" style="margin-top:14px; background:#07090D;"></div>
+    </div>
+
+    <div class="box">
+      <div class="lbl">Upgrade to Paid x402 Verification (Base USDC)</div>
+      <p style="margin:4px 0 8px; color:var(--muted); font-size:14px;">Quick Token Check (<strong>$0.005</strong>):</p>
+      <pre>{curl_token_check}</pre>
+      <p style="margin:12px 0 8px; color:var(--muted); font-size:14px;">Deep Source &amp; Proxy Audit (<strong>$0.25</strong>):</p>
+      <pre>{curl_deep_audit}</pre>
+    </div>
+  </div>
+  <script>
+    (function () {{
+      var btn = document.getElementById("run-scan-btn");
+      var out = document.getElementById("live-out");
+      var targetAddr = {json.dumps(str(report_ctx["address"]))};
+      var chainId = {chain_id};
+
+      btn.addEventListener("click", async function () {{
+        btn.disabled = true;
+        btn.textContent = "Scanning on-chain bytecode...";
+        out.style.display = "block";
+        out.textContent = "Calling /mcp check_token_honeypot & scan_contract_selectors...";
+        try {{
+          var res = await fetch("/mcp", {{
+            method: "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            body: JSON.stringify([
+              {{
+                jsonrpc: "2.0", id: 1, method: "tools/call",
+                params: {{ name: "check_token_honeypot", arguments: {{ token_address: targetAddr, chain_id: chainId }} }}
+              }},
+              {{
+                jsonrpc: "2.0", id: 2, method: "tools/call",
+                params: {{ name: "scan_contract_selectors", arguments: {{ target_address: targetAddr, chain_id: chainId }} }}
+              }}
+            ])
+          }});
+          var data = await res.json();
+          out.textContent = JSON.stringify(data, null, 2);
+        }} catch (err) {{
+          out.textContent = "Scan error: " + (err && err.message ? err.message : String(err));
+        }} finally {{
+          btn.disabled = false;
+          btn.textContent = "Run Live Stage-1 Scan ($0.00)";
+        }}
+      }});
+    }})();
+  </script>
+</body>
+</html>"""
+
+
+def _build_landing_html(public_url: str, x402_cfg: X402Config) -> str:
+    """Render self-contained dark-mode Landing Page + Live Stage-1 Playground + Threat Feed."""
+    safe_url = html.escape(public_url, quote=True)
+    price_token = f"{x402_cfg.price_per_token_check_usdc:.3f}".rstrip("0").rstrip(".")
+    price_audit = f"{x402_cfg.price_per_eval_usdc:.3f}".rstrip("0").rstrip(".")
+    price_deep = f"{x402_cfg.price_per_deep_audit_usdc:.2f}"
+
+    cursor_snippet = html.escape(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "web3-systemic-agent": {
+                        "url": f"{public_url}/mcp",
+                    }
+                }
+            },
+            indent=2,
+        ),
+        quote=True,
+    )
+    claude_snippet = html.escape(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "web3-systemic-agent": {
+                        "command": "uvx",
+                        "args": [
+                            "--from",
+                            "git+https://github.com/RafaCoelho33/web3-systemic-agent",
+                            "web3-systemic-agent",
+                        ],
+                    }
+                }
+            },
+            indent=2,
+        ),
+        quote=True,
+    )
+    uvx_snippet = html.escape(
+        "uvx --from git+https://github.com/RafaCoelho33/web3-systemic-agent web3-systemic-agent",
+        quote=True,
+    )
+    x402_snippet = html.escape(
+        f"# 1. Quick Token Check (${price_token} USDC)\n"
+        f'curl -X POST "{public_url}/token/check" -H "Content-Type: application/json" \\\n'
+        f'  -d \'{{"token_address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "chain_id": 8453}}\'\n\n'
+        f"# 2. Quick AI Contract Audit (${price_audit} USDC)\n"
+        f'curl -X POST "{public_url}/audit" -H "Content-Type: application/json" \\\n'
+        f'  -d \'{{"target_address": "0x4200000000000000000000000000000000000006", "chain_id": 8453}}\'\n\n'
+        f"# 3. Deep Source & Proxy Audit (${price_deep} USDC)\n"
+        f'curl -X POST "{public_url}/audit/deep" -H "Content-Type: application/json" \\\n'
+        f'  -d \'{{"target_address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "chain_id": 8453, "resolve_proxy": true, "fetch_verified_source": true}}\'',
+        quote=True,
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Web3 Systemic Agent v1.0.2 — Autonomous EVM Security Firewall</title>
+  <style>
+    :root {{
+      --bg:#07090D; --panel:#10141D; --panel-alt:#0B0E15; --border:#1E293B;
+      --text:#F8FAFC; --muted:#94A3B8; --blue:#0052FF; --cyan:#00D2FF;
+      --green:#00D26A; --amber:#FAAD14; --red:#FF4D4F;
+    }}
+    * {{ box-sizing:border-box; }}
+    body {{
+      margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+      background:radial-gradient(circle at top right, rgba(0,82,255,0.14), transparent 42%), var(--bg);
+      color:var(--text); line-height:1.5;
+    }}
+    .container {{ max-width:1120px; margin:0 auto; padding:32px 20px 72px; }}
+    .hero {{ display:flex; justify-content:space-between; align-items:flex-start; gap:20px; flex-wrap:wrap; margin-bottom:28px; }}
+    .brand {{ display:flex; align-items:center; gap:14px; }}
+    .pill {{ display:inline-block; padding:4px 12px; border-radius:999px; font-size:12px; font-weight:700; background:rgba(0,210,255,0.12); color:var(--cyan); border:1px solid rgba(0,210,255,0.35); }}
+    h1 {{ margin:6px 0 6px; font-size:30px; letter-spacing:-0.02em; }}
+    .subtitle {{ color:var(--muted); margin:0; font-size:15px; }}
+    .links {{ display:flex; gap:10px; flex-wrap:wrap; }}
+    .link-btn {{ padding:8px 14px; border-radius:10px; border:1px solid var(--border); background:var(--panel); color:var(--text); text-decoration:none; font-size:13px; font-weight:600; }}
+    .link-btn:hover {{ border-color:var(--cyan); }}
+    .card {{ background:var(--panel); border:1px solid var(--border); border-radius:16px; padding:22px; margin-bottom:22px; }}
+    .card-title {{ margin:0 0 14px; font-size:18px; display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; }}
+    .form-row {{ display:grid; grid-template-columns:1fr 220px auto; gap:10px; }}
+    @media (max-width: 760px) {{ .form-row {{ grid-template-columns:1fr; }} }}
+    input, select {{
+      background:var(--panel-alt); border:1px solid var(--border); color:var(--text);
+      padding:11px 14px; border-radius:10px; font-size:14px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    }}
+    .btn {{ background:var(--blue); color:#fff; border:none; padding:11px 18px; border-radius:10px; font-weight:700; cursor:pointer; font-size:14px; }}
+    .btn:hover {{ background:#1652F0; }}
+    .btn-ghost {{ background:var(--panel-alt); color:var(--cyan); border:1px solid var(--border); padding:7px 12px; border-radius:8px; font-size:12px; font-weight:600; cursor:pointer; }}
+    .btn-ghost:hover {{ border-color:var(--cyan); }}
+    .chips {{ display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; align-items:center; }}
+    .verdict-box {{ margin-top:18px; padding:16px; border-radius:12px; background:var(--panel-alt); border:1px solid var(--border); display:none; }}
+    .verdict-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; margin-top:12px; }}
+    .stat {{ background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:12px; }}
+    .stat-lbl {{ font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }}
+    .stat-val {{ font-size:16px; font-weight:700; margin-top:4px; }}
+    table {{ width:100%; border-collapse:collapse; font-size:13px; }}
+    th, td {{ text-align:left; padding:10px 8px; border-bottom:1px solid var(--border); }}
+    th {{ color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.06em; }}
+    .mono {{ font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }}
+    .tabs {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }}
+    .tab {{ background:var(--panel-alt); color:var(--muted); border:1px solid var(--border); padding:8px 14px; border-radius:8px; font-size:13px; font-weight:600; cursor:pointer; }}
+    .tab.active {{ color:#fff; border-color:var(--blue); background:rgba(0,82,255,0.22); }}
+    pre {{ margin:0; background:#06080C; border:1px solid var(--border); border-radius:10px; padding:14px; overflow-x:auto; font-size:12px; color:#E2E8F0; }}
+    a.addr-link {{ color:var(--cyan); text-decoration:none; }}
+    a.addr-link:hover {{ text-decoration:underline; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header class="hero">
+      <div class="brand">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="56" height="56">
+          <rect width="128" height="128" rx="28" fill="#0D111A" stroke="#1E293B" stroke-width="3"/>
+          <path d="M64 16 L104 32 C104 76 74 104 64 112 C54 104 24 76 24 32 Z" fill="#0052FF"/>
+          <circle cx="64" cy="64" r="16" fill="#00D2FF"/>
+          <path d="M58 64 L62 68 L70 58" fill="none" stroke="#FFFFFF" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <div>
+          <span class="pill">v1.0.2 • Base Mainnet &amp; x402 Bazaar</span>
+          <h1>Web3 Systemic Agent</h1>
+          <p class="subtitle">Autonomous EVM Security Firewall, MCP Server &amp; x402 Auditor on Base</p>
+        </div>
+      </div>
+      <div class="links">
+        <a class="link-btn" href="/?format=json">Discovery JSON</a>
+        <a class="link-btn" href="/feed/recent">Feed JSON</a>
+        <a class="link-btn" href="/llms.txt">llms.txt</a>
+        <a class="link-btn" href="/.well-known/x402">x402 Manifest</a>
+      </div>
+    </header>
+
+    <section class="card">
+      <h2 class="card-title">
+        <span>Interactive Free Stage-1 Scanner Playground</span>
+        <span class="pill">Free via POST /mcp</span>
+      </h2>
+      <div class="form-row">
+        <input id="scan-addr" type="text" value="0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" placeholder="0x... EVM Contract or Token Address" aria-label="Contract Address" />
+        <select id="scan-chain" aria-label="EVM Chain">
+          <option value="8453" selected>8453 — Base Mainnet</option>
+          <option value="84532">84532 — Base Sepolia</option>
+          <option value="42161">42161 — Arbitrum One</option>
+        </select>
+        <button id="scan-btn" class="btn" type="button">Scan Free (Stage 1)</button>
+      </div>
+      <div class="chips">
+        <span style="font-size:12px;color:var(--muted);">Quick examples:</span>
+        <button class="btn-ghost example-btn" type="button" data-addr="0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" data-chain="8453">Base USDC</button>
+        <button class="btn-ghost example-btn" type="button" data-addr="0x4200000000000000000000000000000000000006" data-chain="8453">Base WETH</button>
+      </div>
+      <div id="verdict-box" class="verdict-box">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+          <strong id="verdict-title">Stage-1 Scan Result</strong>
+          <a id="verdict-report-link" class="addr-link mono" href="#">Open Shareable Report →</a>
+        </div>
+        <div id="verdict-grid" class="verdict-grid"></div>
+        <div style="margin-top:14px;">
+          <div class="stat-lbl" style="margin-bottom:6px;">Upgrade with x402 Micropayments (USDC on Base)</div>
+          <pre id="verdict-upgrade"></pre>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2 class="card-title">
+        <span>Live Threat Intelligence Feed</span>
+        <button id="feed-refresh" class="btn-ghost" type="button">Refresh Feed</button>
+      </h2>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Contract</th>
+              <th>Chain</th>
+              <th>Source</th>
+              <th>Decision</th>
+              <th>Score</th>
+              <th>LLM</th>
+              <th>Time</th>
+            </tr>
+          </thead>
+          <tbody id="feed-body">
+            <tr><td colspan="7" style="color:var(--muted);">Loading live evaluations...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2 class="card-title">
+        <span>Quick Install Snippets</span>
+        <button id="copy-snippet" class="btn-ghost" type="button">Copy Snippet</button>
+      </h2>
+      <div class="tabs">
+        <button class="tab active" type="button" data-tab="cursor">Cursor (.cursor/mcp.json)</button>
+        <button class="tab" type="button" data-tab="claude">Claude Desktop</button>
+        <button class="tab" type="button" data-tab="uvx">uvx CLI</button>
+        <button class="tab" type="button" data-tab="x402">x402 HTTP</button>
+      </div>
+      <pre id="snippet-cursor">{cursor_snippet}</pre>
+      <pre id="snippet-claude" style="display:none;">{claude_snippet}</pre>
+      <pre id="snippet-uvx" style="display:none;">{uvx_snippet}</pre>
+      <pre id="snippet-x402" style="display:none;">{x402_snippet}</pre>
+    </section>
+  </div>
+
+  <script>
+    (function () {{
+      var PUBLIC_URL = {json.dumps(safe_url)};
+      var addrInput = document.getElementById("scan-addr");
+      var chainSelect = document.getElementById("scan-chain");
+      var scanBtn = document.getElementById("scan-btn");
+      var verdictBox = document.getElementById("verdict-box");
+      var verdictTitle = document.getElementById("verdict-title");
+      var verdictGrid = document.getElementById("verdict-grid");
+      var verdictReport = document.getElementById("verdict-report-link");
+      var verdictUpgrade = document.getElementById("verdict-upgrade");
+
+      function addStat(label, value) {{
+        var div = document.createElement("div");
+        div.className = "stat";
+        var l = document.createElement("div");
+        l.className = "stat-lbl";
+        l.textContent = label;
+        var v = document.createElement("div");
+        v.className = "stat-val";
+        v.textContent = String(value);
+        div.appendChild(l);
+        div.appendChild(v);
+        verdictGrid.appendChild(div);
+      }}
+
+      function parseMcpToolResult(rpcEntry) {{
+        if (!rpcEntry || !rpcEntry.result) return null;
+        if (rpcEntry.result.structuredContent) return rpcEntry.result.structuredContent;
+        if (Array.isArray(rpcEntry.result.content) && rpcEntry.result.content[0] && rpcEntry.result.content[0].text) {{
+          try {{ return JSON.parse(rpcEntry.result.content[0].text); }} catch (e) {{ return null; }}
+        }}
+        return rpcEntry.result;
+      }}
+
+      async function runScan() {{
+        var addr = (addrInput.value || "").trim();
+        var chainId = parseInt(chainSelect.value || "8453", 10);
+        if (!addr) return;
+        scanBtn.disabled = true;
+        scanBtn.textContent = "Scanning...";
+        verdictBox.style.display = "block";
+        verdictTitle.textContent = "Running Stage-1 MCP tools...";
+        verdictGrid.innerHTML = "";
+        try {{
+          var resp = await fetch("/mcp", {{
+            method: "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            body: JSON.stringify([
+              {{
+                jsonrpc: "2.0", id: 1, method: "tools/call",
+                params: {{ name: "check_token_honeypot", arguments: {{ token_address: addr, chain_id: chainId }} }}
+              }},
+              {{
+                jsonrpc: "2.0", id: 2, method: "tools/call",
+                params: {{ name: "scan_contract_selectors", arguments: {{ target_address: addr, chain_id: chainId }} }}
+              }}
+            ])
+          }});
+          var data = await resp.json();
+          var hp = parseMcpToolResult(Array.isArray(data) ? data[0] : data) || {{}};
+          var sel = parseMcpToolResult(Array.isArray(data) ? data[1] : null) || {{}};
+
+          var suspect = Boolean(hp.is_honeypot_suspect);
+          verdictTitle.textContent = suspect ? "HIGH RISK — Honeypot Indicators Found" : ("Stage-1 Verdict: " + (sel.risk_level || "SCANNED"));
+          verdictTitle.style.color = suspect ? "var(--red)" : (sel.risk_level === "HIGH" ? "var(--amber)" : "var(--green)");
+          verdictReport.href = "/report/" + chainId + "/" + encodeURIComponent(addr) + "?format=html";
+
+          addStat("Honeypot Suspect", suspect ? "YES" : "NO");
+          addStat("Risk Score", hp.risk_score !== undefined ? hp.risk_score + " / 10" : "N/A");
+          addStat("Selector Risk", sel.risk_level || "N/A");
+          addStat("Bytecode Size", (sel.bytecode_size_bytes !== undefined ? sel.bytecode_size_bytes : 0) + " bytes");
+
+          verdictUpgrade.textContent =
+            "Quick Token Check ($0.005): " + PUBLIC_URL + "/token/check?address=" + addr + "&chain_id=" + chainId + "\\n" +
+            "Quick AI Audit    ($0.015): POST " + PUBLIC_URL + "/audit\\n" +
+            "Deep Source Audit ($0.25) : POST " + PUBLIC_URL + "/audit/deep";
+        }} catch (err) {{
+          verdictTitle.textContent = "Scan failed: " + (err && err.message ? err.message : String(err));
+          verdictTitle.style.color = "var(--red)";
+        }} finally {{
+          scanBtn.disabled = false;
+          scanBtn.textContent = "Scan Free (Stage 1)";
+        }}
+      }}
+
+      scanBtn.addEventListener("click", runScan);
+      document.querySelectorAll(".example-btn").forEach(function (btn) {{
+        btn.addEventListener("click", function () {{
+          addrInput.value = btn.getAttribute("data-addr") || "";
+          chainSelect.value = btn.getAttribute("data-chain") || "8453";
+          runScan();
+        }});
+      }});
+
+      async function loadFeed() {{
+        var tbody = document.getElementById("feed-body");
+        try {{
+          var resp = await fetch("/feed/recent?limit=10");
+          var data = await resp.json();
+          var items = Array.isArray(data.items) ? data.items : [];
+          tbody.innerHTML = "";
+          if (!items.length) {{
+            var emptyRow = document.createElement("tr");
+            var emptyCell = document.createElement("td");
+            emptyCell.colSpan = 7;
+            emptyCell.style.color = "var(--muted)";
+            emptyCell.textContent = "No evaluations recorded yet. Run a scan above to populate the feed.";
+            emptyRow.appendChild(emptyCell);
+            tbody.appendChild(emptyRow);
+            return;
+          }}
+          items.forEach(function (it) {{
+            var tr = document.createElement("tr");
+            var tdAddr = document.createElement("td");
+            tdAddr.className = "mono";
+            if (it.target_address && it.chain_id) {{
+              var a = document.createElement("a");
+              a.className = "addr-link";
+              a.href = "/report/" + it.chain_id + "/" + encodeURIComponent(it.target_address) + "?format=html";
+              a.textContent = it.target_address.length > 14 ? (it.target_address.slice(0, 8) + "..." + it.target_address.slice(-6)) : it.target_address;
+              tdAddr.appendChild(a);
+            }} else {{
+              tdAddr.textContent = it.rule_id || "—";
+            }}
+            tr.appendChild(tdAddr);
+
+            [it.chain_id || "—", it.source || "api", it.decision || "—", it.risk_score !== null && it.risk_score !== undefined ? it.risk_score : "—", it.llm_invoked ? "Yes" : "Stage-1", it.created_at || "—"].forEach(function (val) {{
+              var td = document.createElement("td");
+              td.textContent = String(val);
+              tr.appendChild(td);
+            }});
+            tbody.appendChild(tr);
+          }});
+        }} catch (err) {{
+          tbody.innerHTML = "";
+          var errRow = document.createElement("tr");
+          var errCell = document.createElement("td");
+          errCell.colSpan = 7;
+          errCell.style.color = "var(--red)";
+          errCell.textContent = "Failed to load feed.";
+          errRow.appendChild(errCell);
+          tbody.appendChild(errRow);
+        }}
+      }}
+
+      document.getElementById("feed-refresh").addEventListener("click", loadFeed);
+      loadFeed();
+
+      var activeTab = "cursor";
+      document.querySelectorAll(".tab").forEach(function (tab) {{
+        tab.addEventListener("click", function () {{
+          activeTab = tab.getAttribute("data-tab") || "cursor";
+          document.querySelectorAll(".tab").forEach(function (t) {{ t.classList.remove("active"); }});
+          tab.classList.add("active");
+          ["cursor", "claude", "uvx", "x402"].forEach(function (name) {{
+            var pre = document.getElementById("snippet-" + name);
+            if (pre) pre.style.display = name === activeTab ? "block" : "none";
+          }});
+        }});
+      }});
+
+      document.getElementById("copy-snippet").addEventListener("click", function () {{
+        var pre = document.getElementById("snippet-" + activeTab);
+        if (pre && navigator.clipboard) {{
+          navigator.clipboard.writeText(pre.textContent || "");
+        }}
+      }});
+    }})();
+  </script>
+</body>
+</html>"""
 
 
 def create_app(
@@ -718,7 +1702,7 @@ def create_app(
 
     app = FastAPI(
         title="Web3 Condition-Action Trigger Agent",
-        version="1.0.0",
+        version="1.0.2",
         description=(
             "Autonomous Web3 Agent for deterministic on-chain gatekeeping "
             "and LLM-powered semantic governance/security auditing."
@@ -729,23 +1713,124 @@ def create_app(
         openapi_url="/openapi.json",
     )
 
-    # Enable CORS for B2B/Micro-SaaS integration
-    raw_origins = os.getenv("CORS_ALLOW_ORIGINS", "*")
-    origins = [o.strip() for o in raw_origins.split(",") if o.strip()]
-    if not origins:
-        origins = ["*"]
-    allow_credentials = "*" not in origins
+    # Associate engine, storage, worker pool, and x402 state with application
+    active_engine = engine if engine is not None else ConditionAgentEngine()
+    active_storage = storage or getattr(active_engine, "storage", None) or AgentStorage()
+    active_x402_config = x402_config if x402_config is not None else X402Config()
+    active_facilitator = facilitator if facilitator is not None else get_x402_facilitator(active_x402_config)
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=origins,
-        allow_credentials=allow_credentials,
-        allow_methods=["*"],
-        allow_headers=["*"],
-        expose_headers=["X-PAYMENT-REQUIRED", "X-PAYMENT-RESPONSE", "PAYMENT-RESPONSE", "Payment-Required"],
+    app.state.engine = active_engine
+    app.state.storage = active_storage
+    app.state.worker_pool = AgentWorkerPool(
+        engine=active_engine, num_workers=2, storage=active_storage
     )
+    app.state.x402_config = active_x402_config
+    app.state.facilitator = active_facilitator
+    app.state.scanner_active = False
+    app.state.scanner_task = None
+    app.state.mcp_server = Web3SystemicMCPServer(
+        engine=active_engine,
+        x402_config=active_x402_config,
+        facilitator=active_facilitator,
+        storage=active_storage,
+        remote_mode=False,
+    )
+    app.state.preflight_firewall = PreflightFirewall()
+    app.state.source_resolver = ContractSourceResolver()
 
-    # Per-IP Sliding-Window Rate Limiter
+    # ---------------------------------------------------------------------
+    # Middlewares (Registered innermost -> outermost due to Starlette LIFO)
+    # ---------------------------------------------------------------------
+
+    # 1. Innermost: Intercept paid endpoints for Coinbase CDP Crawler & x402 Bazaar compliance
+    @app.middleware("http")
+    async def x402_evaluate_interceptor(request: Request, call_next):
+        clean_path = request.url.path.rstrip("/")
+        if clean_path in ("/evaluate", "/audit", "/preflight", "/audit/deep", "/token/check") and request.method in ("GET", "POST"):
+            x402_cfg: X402Config = getattr(app.state, "x402_config", None) or X402Config()
+            if x402_cfg.enabled:
+                payment_hdr = (
+                    request.headers.get("x-payment")
+                    or request.headers.get("payment-signature")
+                    or request.headers.get("x-payment-signature")
+                    or request.headers.get("X-PAYMENT")
+                    or request.headers.get("PAYMENT-SIGNATURE")
+                )
+                has_payment = bool(payment_hdr and payment_hdr.strip())
+                if not has_payment:
+                    if clean_path == "/preflight":
+                        req_price = x402_cfg.price_per_preflight_usdc
+                    elif clean_path == "/audit/deep":
+                        req_price = x402_cfg.price_per_deep_audit_usdc
+                    elif clean_path == "/token/check":
+                        req_price = x402_cfg.price_per_token_check_usdc
+                    else:
+                        req_price = x402_cfg.price_per_eval_usdc
+                    return build_402_response(
+                        x402_cfg,
+                        request.url.path,
+                        req_price,
+                    )
+        return await call_next(request)
+
+    # 2. Public Evaluate-Only Lockdown Mode
+    app.state.public_evaluate_only = effective_public_evaluate_only
+
+    if effective_public_evaluate_only:
+        @app.middleware("http")
+        async def public_evaluate_only_middleware(request: Request, call_next):
+            # Optional admin bypass if ADMIN_API_KEY is configured
+            admin_key = os.getenv("ADMIN_API_KEY", "").strip()
+            if admin_key and request.headers.get("x-admin-api-key") == admin_key:
+                return await call_next(request)
+
+            allowed_paths = {
+                "/",
+                "/openapi.json",
+                "/favicon.ico",
+                "/icon.svg",
+                "/health",
+                "/evaluate",
+                "/audit",
+                "/preflight",
+                "/audit/deep",
+                "/token/check",
+                "/feed/recent",
+                "/rules/evaluate-batch",
+                "/rules/validate",
+                "/rules/enqueue",
+                "/mcp",
+                "/robots.txt",
+                "/llms.txt",
+                "/llms-full.txt",
+                "/mcp/server-card",
+                "/mcp/server-card.json",
+                "/security.txt",
+            }
+            clean_path = request.url.path.rstrip("/") or "/"
+            if (
+                clean_path in allowed_paths
+                or clean_path.startswith("/jobs/")
+                or clean_path.startswith("/report/")
+                or clean_path.startswith("/.well-known/")
+                or clean_path.startswith("/mcp/.well-known/")
+            ):
+                return await call_next(request)
+
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": "Forbidden",
+                    "message": "Public access is restricted to evaluation endpoints only.",
+                },
+                headers={
+                    "X-Content-Type-Options": "nosniff",
+                    "X-Frame-Options": "DENY",
+                    "Referrer-Policy": "no-referrer",
+                },
+            )
+
+    # 3. Per-IP Sliding-Window Rate Limiter
     try:
         default_rate_limit = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
     except (ValueError, TypeError):
@@ -796,114 +1881,7 @@ def create_app(
             buckets[client_ip].append(now)
             return await call_next(request)
 
-    # Public Evaluate-Only Lockdown Mode
-    app.state.public_evaluate_only = effective_public_evaluate_only
-
-    if effective_public_evaluate_only:
-        @app.middleware("http")
-        async def public_evaluate_only_middleware(request: Request, call_next):
-            # Optional admin bypass if ADMIN_API_KEY is configured
-            admin_key = os.getenv("ADMIN_API_KEY", "").strip()
-            if admin_key and request.headers.get("x-admin-api-key") == admin_key:
-                return await call_next(request)
-
-            allowed_paths = {
-                "/",
-                "/openapi.json",
-                "/favicon.ico",
-                "/icon.svg",
-                "/health",
-                "/evaluate",
-                "/audit",
-                "/preflight",
-                "/audit/deep",
-                "/rules/evaluate-batch",
-                "/rules/validate",
-                "/rules/enqueue",
-                "/mcp",
-                "/robots.txt",
-                "/llms.txt",
-                "/llms-full.txt",
-                "/.well-known/x402",
-                "/.well-known/mcp/server-card.json",
-                "/.well-known/mcp.json",
-                "/mcp/server-card",
-                "/mcp/server-card.json",
-                "/.well-known/agent.json",
-                "/.well-known/security.txt",
-                "/security.txt",
-            }
-            path = request.url.path
-            if path in allowed_paths or path.startswith("/jobs/"):
-                return await call_next(request)
-
-            return JSONResponse(
-                status_code=403,
-                content={
-                    "error": "Forbidden",
-                    "message": "Public access is restricted to evaluation endpoints only.",
-                },
-                headers={
-                    "X-Content-Type-Options": "nosniff",
-                    "X-Frame-Options": "DENY",
-                    "Referrer-Policy": "no-referrer",
-                },
-            )
-
-    # Associate engine, storage, worker pool, and x402 state with application
-    active_engine = engine if engine is not None else ConditionAgentEngine()
-    active_storage = storage or getattr(active_engine, "storage", None) or AgentStorage()
-    active_x402_config = x402_config if x402_config is not None else X402Config()
-    active_facilitator = facilitator if facilitator is not None else get_x402_facilitator(active_x402_config)
-
-    app.state.engine = active_engine
-    app.state.storage = active_storage
-    app.state.worker_pool = AgentWorkerPool(
-        engine=active_engine, num_workers=2, storage=active_storage
-    )
-    app.state.x402_config = active_x402_config
-    app.state.facilitator = active_facilitator
-    app.state.scanner_active = False
-    app.state.scanner_task = None
-    app.state.mcp_server = Web3SystemicMCPServer(
-        engine=active_engine,
-        x402_config=active_x402_config,
-        facilitator=active_facilitator,
-        storage=active_storage,
-    )
-    app.state.preflight_firewall = PreflightFirewall()
-    app.state.source_resolver = ContractSourceResolver()
-
-    # Intercept /evaluate, /audit, /preflight, and /audit/deep requests for Coinbase CDP Crawler & x402 Bazaar compliance
-    @app.middleware("http")
-    async def x402_evaluate_interceptor(request: Request, call_next):
-        clean_path = request.url.path.rstrip("/")
-        if clean_path in ("/evaluate", "/audit", "/preflight", "/audit/deep") and request.method in ("GET", "POST"):
-            x402_cfg: X402Config = getattr(app.state, "x402_config", None) or X402Config()
-            if x402_cfg.enabled:
-                payment_hdr = (
-                    request.headers.get("x-payment")
-                    or request.headers.get("payment-signature")
-                    or request.headers.get("x-payment-signature")
-                    or request.headers.get("X-PAYMENT")
-                    or request.headers.get("PAYMENT-SIGNATURE")
-                )
-                has_payment = bool(payment_hdr and payment_hdr.strip())
-                if not has_payment:
-                    if clean_path == "/preflight":
-                        req_price = x402_cfg.price_per_preflight_usdc
-                    elif clean_path == "/audit/deep":
-                        req_price = x402_cfg.price_per_deep_audit_usdc
-                    else:
-                        req_price = x402_cfg.price_per_eval_usdc
-                    return build_402_response(
-                        x402_cfg,
-                        request.url.path,
-                        req_price,
-                    )
-        return await call_next(request)
-
-    # Defensive HTTP Security Headers (applied to all responses)
+    # 4. Defensive HTTP Security Headers (applied to all responses, including 402/403/404/429)
     @app.middleware("http")
     async def security_headers_middleware(request: Request, call_next):
         response = await call_next(request)
@@ -911,6 +1889,22 @@ def create_app(
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
         return response
+
+    # 5. Outermost: Enable CORS for B2B/Micro-SaaS integration (covers 402/403/404/429 responses)
+    raw_origins = os.getenv("CORS_ALLOW_ORIGINS", "*")
+    origins = [o.strip() for o in raw_origins.split(",") if o.strip()]
+    if not origins:
+        origins = ["*"]
+    allow_credentials = "*" not in origins
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=allow_credentials,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["X-PAYMENT-REQUIRED", "X-PAYMENT-RESPONSE", "PAYMENT-RESPONSE", "Payment-Required"],
+    )
 
     # ---------------------------------------------------------------------
     # Standardized Exception Handlers
@@ -942,7 +1936,12 @@ def create_app(
     @app.exception_handler(HTTPException)
     async def http_exception_handler(request: Request, exc: HTTPException):
         logger.warning(f"HTTPException on {request.url.path} [{exc.status_code}]: {exc.detail}")
-        if exc.status_code >= 400:
+        clean_path = request.url.path.rstrip("/") or "/"
+        is_well_known_404 = (
+            exc.status_code == 404
+            and (clean_path.startswith("/.well-known/") or clean_path.startswith("/mcp/.well-known/"))
+        )
+        if exc.status_code >= 400 and not is_well_known_404:
             storage_inst: Optional[AgentStorage] = getattr(app.state, "storage", None)
             if storage_inst is not None:
                 try:
@@ -1001,12 +2000,19 @@ def create_app(
         tags=["Monitoring"],
         summary="Service Discovery and Root Status",
     )
-    async def root():
+    async def root(request: Request, format: Optional[str] = None):
         """
-        Root discovery endpoint returning active service status, x402 payment gate configuration,
-        and canonical API endpoint routes.
+        Root discovery endpoint supporting content negotiation:
+        serves interactive HTML landing page & playground for browsers (?format=html or Accept: text/html),
+        and canonical JSON ServiceDiscoveryResponse for programmatic clients.
         """
         x402_cfg: X402Config = getattr(app.state, "x402_config", None) or X402Config()
+        if _wants_html_response(request, format):
+            return HTMLResponse(
+                content=_build_landing_html(_get_public_url(), x402_cfg),
+                status_code=status.HTTP_200_OK,
+            )
+
         if getattr(app.state, "public_evaluate_only", False):
             endpoints = {
                 "openapi": "/openapi.json",
@@ -1016,6 +2022,9 @@ def create_app(
                 "audit": "/audit",
                 "preflight": "/preflight",
                 "deep_audit": "/audit/deep",
+                "token_check": "/token/check",
+                "feed_recent": "/feed/recent",
+                "report_template": "/report/{chain_id}/{address}",
                 "evaluate_batch": "/rules/evaluate-batch",
                 "enqueue_job": "/rules/enqueue",
                 "mcp": "/mcp",
@@ -1034,6 +2043,9 @@ def create_app(
                 "audit": "/audit",
                 "preflight": "/preflight",
                 "deep_audit": "/audit/deep",
+                "token_check": "/token/check",
+                "feed_recent": "/feed/recent",
+                "report_template": "/report/{chain_id}/{address}",
                 "evaluate_batch": "/rules/evaluate-batch",
                 "enqueue_job": "/rules/enqueue",
                 "governance_audit": "/governance/audit-proposals",
@@ -1048,7 +2060,7 @@ def create_app(
             }
         return {
             "service": "Web3 Condition-Action Trigger Agent",
-            "version": "1.0.0",
+            "version": "1.0.2",
             "status": "online",
             "x402_enabled": x402_cfg.enabled,
             "x402_network": x402_cfg.network,
@@ -1056,6 +2068,148 @@ def create_app(
             "pay_to_address": x402_cfg.pay_to_address,
             "endpoints": endpoints,
         }
+
+    @app.head("/", include_in_schema=False)
+    async def head_root():
+        """HEAD probe handler for root discovery endpoint."""
+        return Response(status_code=status.HTTP_200_OK, media_type="application/json")
+
+    @app.get(
+        "/feed/recent",
+        tags=["Monitoring"],
+        summary="Live Autonomous Contract & Pool Security Feed",
+    )
+    async def get_recent_feed(limit: int = 20, source: Optional[str] = None):
+        """
+        Public free feed of recently audited smart contracts, DEX pools, and tokens.
+        """
+        clamped_limit = max(1, min(int(limit), 50))
+        storage_inst: Optional[AgentStorage] = getattr(app.state, "storage", None)
+        rows: List[Dict[str, Any]] = []
+        if storage_inst is not None and hasattr(storage_inst, "get_recent_feed_evaluations"):
+            rows = await storage_inst.get_recent_feed_evaluations(
+                limit=max(clamped_limit * 2, 20)
+            )
+
+        if source is not None and source.strip():
+            source_filter = source.strip().lower()
+            rows = [
+                r for r in rows
+                if str(r.get("source") or "").strip().lower() == source_filter
+            ]
+
+        public_url = _get_public_url()
+        items = [_build_feed_item(row, public_url) for row in rows[:clamped_limit]]
+        return {
+            "service": "Web3 Systemic Agent",
+            "count": len(items),
+            "items": items,
+        }
+
+    @app.head("/feed/recent", include_in_schema=False)
+    async def head_recent_feed():
+        """HEAD probe handler for public security feed."""
+        return Response(status_code=status.HTTP_200_OK, media_type="application/json")
+
+    @app.get(
+        "/report/{chain_id}/{address}/card.svg",
+        tags=["Monitoring"],
+        summary="Shareable OpenGraph SVG Security Card",
+    )
+    async def get_contract_report_card_svg(chain_id: int, address: str):
+        """Render a 1200x630 SVG OpenGraph badge card for a target contract on a chain."""
+        if not Web3.is_address(address):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid EVM address: {address}",
+            )
+        checksum_addr = Web3.to_checksum_address(address)
+        report_ctx = await _build_contract_report_context(app, chain_id, checksum_addr)
+        svg_str = _build_report_svg(report_ctx)
+        return Response(
+            content=svg_str,
+            media_type="image/svg+xml",
+            headers={"Cache-Control": "public, max-age=300"},
+        )
+
+    @app.head("/report/{chain_id}/{address}/card.svg", include_in_schema=False)
+    async def head_contract_report_card_svg(chain_id: int, address: str):
+        """HEAD probe handler for shareable SVG security card."""
+        if not Web3.is_address(address):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid EVM address: {address}",
+            )
+        return Response(
+            status_code=status.HTTP_200_OK,
+            media_type="image/svg+xml",
+            headers={"Cache-Control": "public, max-age=300"},
+        )
+
+    @app.get(
+        "/report/{chain_id}/{address}",
+        tags=["Monitoring"],
+        summary="Shareable Contract Security Report (HTML or JSON)",
+    )
+    async def get_contract_report(
+        chain_id: int,
+        address: str,
+        request: Request,
+        format: Optional[str] = None,
+    ):
+        """
+        Returns a shareable contract security report combining evaluation history and
+        cached static bytecode analysis (HTML with OpenGraph meta tags for browsers,
+        structured JSON for programmatic callers).
+        """
+        if not Web3.is_address(address):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid EVM address: {address}",
+            )
+        checksum_addr = Web3.to_checksum_address(address)
+        report_ctx = await _build_contract_report_context(app, chain_id, checksum_addr)
+
+        if _wants_html_response(request, format):
+            return HTMLResponse(
+                content=_build_report_html(report_ctx, _get_public_url()),
+                status_code=status.HTTP_200_OK,
+            )
+
+        return {
+            "address": report_ctx["address"],
+            "chain_id": report_ctx["chain_id"],
+            "chain_name": report_ctx["chain_name"],
+            "evaluated": report_ctx["evaluated"],
+            "latest_decision": report_ctx["latest_decision"],
+            "risk_score": report_ctx["risk_score"],
+            "verdict_badge": report_ctx["verdict_badge"],
+            "bytecode_cached": report_ctx["bytecode_cached"],
+            "bytecode_size_bytes": report_ctx["bytecode_size_bytes"],
+            "selectors_count": report_ctx["selectors_count"],
+            "high_risk_signatures": report_ctx["high_risk_signatures"],
+            "honeypot_analysis": report_ctx["honeypot_analysis"],
+            "rule_id": report_ctx["rule_id"],
+            "source": report_ctx["source"],
+            "stage1_passed": report_ctx["stage1_passed"],
+            "llm_invoked": report_ctx["llm_invoked"],
+            "created_at": report_ctx["created_at"],
+            "report_url": report_ctx["report_url"],
+            "card_svg_url": report_ctx["card_svg_url"],
+            "token_check_x402_url": report_ctx["token_check_x402_url"],
+            "audit_x402_url": report_ctx["audit_x402_url"],
+            "deep_audit_x402_url": report_ctx["deep_audit_x402_url"],
+        }
+
+    @app.head("/report/{chain_id}/{address}", include_in_schema=False)
+    async def head_contract_report(chain_id: int, address: str):
+        """HEAD probe handler for shareable contract security report."""
+        if not Web3.is_address(address):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid EVM address: {address}",
+            )
+        return Response(status_code=status.HTTP_200_OK, media_type="application/json")
 
     @app.get("/favicon.ico", include_in_schema=False)
     async def favicon():
@@ -1084,6 +2238,11 @@ def create_app(
             "tools": tools,
         }
 
+    @app.head("/mcp", include_in_schema=False)
+    async def head_mcp():
+        """HEAD probe handler for MCP discovery endpoint."""
+        return Response(status_code=status.HTTP_200_OK, media_type="application/json")
+
     @app.post(
         "/mcp",
         tags=["MCP Server"],
@@ -1096,7 +2255,10 @@ def create_app(
         """
         mcp: Optional[Web3SystemicMCPServer] = getattr(app.state, "mcp_server", None)
         if mcp is None:
-            mcp = Web3SystemicMCPServer(engine=getattr(app.state, "engine", None))
+            mcp = Web3SystemicMCPServer(
+                engine=getattr(app.state, "engine", None),
+                remote_mode=False,
+            )
             app.state.mcp_server = mcp
 
         try:
@@ -1111,15 +2273,38 @@ def create_app(
                 },
             )
 
+        http_payment_hdr = (
+            request.headers.get("x-payment")
+            or request.headers.get("payment-signature")
+            or request.headers.get("x-payment-signature")
+        )
+
+        def _inject_http_payment(msg: Any) -> None:
+            if not http_payment_hdr or not isinstance(msg, dict):
+                return
+            if msg.get("method") != "tools/call":
+                return
+            params = msg.get("params")
+            if not isinstance(params, dict) or params.get("name") != "deep_semantic_audit":
+                return
+            args = params.get("arguments")
+            if args is None:
+                args = {}
+                params["arguments"] = args
+            if isinstance(args, dict) and not args.get("x402_payment_header"):
+                args["x402_payment_header"] = http_payment_hdr
+
         if isinstance(body, list):
             responses = []
             for item in body:
+                _inject_http_payment(item)
                 _log_mcp_telemetry(item)
                 resp = await mcp.handle_jsonrpc(item)
                 if resp is not None:
                     responses.append(resp)
             return JSONResponse(status_code=status.HTTP_200_OK, content=responses)
 
+        _inject_http_payment(body)
         _log_mcp_telemetry(body)
         rpc_resp = await mcp.handle_jsonrpc(body)
         if rpc_resp is None:
@@ -1131,26 +2316,30 @@ def create_app(
     # Crawler Discovery, Agent-Teaching & Security Endpoints
     # ---------------------------------------------------------------------
 
-    @app.get("/robots.txt", include_in_schema=False)
+    @app.api_route("/robots.txt", methods=["GET", "HEAD"], include_in_schema=False)
     async def get_robots_txt():
         """Returns robots.txt rules for search engine and AI crawlers."""
         return Response(content=ROBOTS_TXT_CONTENT, media_type="text/plain; charset=utf-8")
 
-    @app.get("/llms.txt", include_in_schema=False)
-    @app.get("/llms-full.txt", include_in_schema=False)
+    @app.api_route("/llms.txt", methods=["GET", "HEAD"], include_in_schema=False)
     async def get_llms_txt():
-        """Returns structured Markdown guide teaching LLMs how to use the Web3 Systemic Agent."""
+        """Returns concise Markdown guide teaching LLMs how to use the Web3 Systemic Agent."""
         return Response(content=LLMS_TXT_CONTENT, media_type="text/plain; charset=utf-8")
 
-    @app.get("/icon.svg", include_in_schema=False)
+    @app.api_route("/llms-full.txt", methods=["GET", "HEAD"], include_in_schema=False)
+    async def get_llms_full_txt():
+        """Returns comprehensive Markdown guide teaching LLMs how to use the Web3 Systemic Agent."""
+        return Response(content=LLMS_FULL_TXT_CONTENT, media_type="text/plain; charset=utf-8")
+
+    @app.api_route("/icon.svg", methods=["GET", "HEAD"], include_in_schema=False)
     async def get_icon_svg():
         """Returns static server SVG icon."""
         return Response(content=ICON_SVG_CONTENT, media_type="image/svg+xml")
 
-    @app.get("/.well-known/mcp/server-card.json", include_in_schema=False)
-    @app.get("/.well-known/mcp.json", include_in_schema=False)
-    @app.get("/mcp/server-card", include_in_schema=False)
-    @app.get("/mcp/server-card.json", include_in_schema=False)
+    @app.api_route("/.well-known/mcp/server-card.json", methods=["GET", "HEAD"], include_in_schema=False)
+    @app.api_route("/.well-known/mcp.json", methods=["GET", "HEAD"], include_in_schema=False)
+    @app.api_route("/mcp/server-card", methods=["GET", "HEAD"], include_in_schema=False)
+    @app.api_route("/mcp/server-card.json", methods=["GET", "HEAD"], include_in_schema=False)
     async def get_mcp_server_card():
         """Returns official MCP server card metadata."""
         public_url = (
@@ -1160,14 +2349,17 @@ def create_app(
         ).rstrip("/")
         mcp: Optional[Web3SystemicMCPServer] = getattr(app.state, "mcp_server", None)
         if mcp is None:
-            mcp = Web3SystemicMCPServer(engine=getattr(app.state, "engine", None))
+            mcp = Web3SystemicMCPServer(
+                engine=getattr(app.state, "engine", None),
+                remote_mode=False,
+            )
             app.state.mcp_server = mcp
 
         card = {
             "serverInfo": {
                 "name": "io.github.RafaCoelho33/web3-systemic-agent",
                 "title": "Web3 Systemic Agent",
-                "version": "1.0.0",
+                "version": "1.0.2",
             },
             "protocolVersion": MCP_PROTOCOL_VERSION,
             "websiteUrl": public_url,
@@ -1195,7 +2387,8 @@ def create_app(
         }
         return JSONResponse(status_code=status.HTTP_200_OK, content=card)
 
-    @app.get("/.well-known/agent.json", include_in_schema=False)
+    @app.api_route("/.well-known/agent.json", methods=["GET", "HEAD"], include_in_schema=False)
+    @app.api_route("/.well-known/agent-card.json", methods=["GET", "HEAD"], include_in_schema=False)
     async def get_agent_card():
         """Returns Agent-to-Agent (A2A) agent discovery card."""
         public_url = (
@@ -1206,13 +2399,16 @@ def create_app(
         x402_cfg: X402Config = getattr(app.state, "x402_config", None) or X402Config()
         mcp: Optional[Web3SystemicMCPServer] = getattr(app.state, "mcp_server", None)
         if mcp is None:
-            mcp = Web3SystemicMCPServer(engine=getattr(app.state, "engine", None))
+            mcp = Web3SystemicMCPServer(
+                engine=getattr(app.state, "engine", None),
+                remote_mode=False,
+            )
             app.state.mcp_server = mcp
 
         agent_card = {
             "name": "Web3 Systemic Agent",
             "id": "io.github.RafaCoelho33/web3-systemic-agent",
-            "version": "1.0.0",
+            "version": "1.0.2",
             "description": (
                 "Autonomous Web3 Security and Governance Auditor Agent with Two-Stage "
                 "Hybrid Architecture (zero-cost on-chain gatekeeping + Gemini LLM semantic audits) "
@@ -1234,6 +2430,9 @@ def create_app(
                 "mcp": "/mcp",
                 "evaluate": "/evaluate",
                 "audit": "/audit",
+                "preflight": f"{public_url}/preflight",
+                "deep_audit": f"{public_url}/audit/deep",
+                "token_check": f"{public_url}/token/check",
                 "validate_rule": "/rules/validate",
                 "llms_txt": "/llms.txt",
                 "well_known_x402": "/.well-known/x402",
@@ -1243,24 +2442,67 @@ def create_app(
         }
         return JSONResponse(status_code=status.HTTP_200_OK, content=agent_card)
 
-    @app.get("/.well-known/x402", include_in_schema=False)
+    @app.api_route("/.well-known/owners.json", methods=["GET", "HEAD"], include_in_schema=False)
+    @app.api_route("/mcp/.well-known/owners.json", methods=["GET", "HEAD"], include_in_schema=False)
+    async def get_well_known_owners():
+        """Returns verified project ownership metadata (GitHub + payout wallet)."""
+        x402_cfg: X402Config = getattr(app.state, "x402_config", None) or X402Config()
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "owners": [
+                    {
+                        "handle": "RafaCoelho33",
+                        "github": "https://github.com/RafaCoelho33",
+                        "repository": "https://github.com/RafaCoelho33/web3-systemic-agent",
+                        "wallet": x402_cfg.pay_to_address,
+                        "network": x402_cfg.network,
+                        "verified": True,
+                    }
+                ]
+            },
+        )
+
+    @app.api_route("/.well-known/glama.json", methods=["GET", "HEAD"], include_in_schema=False)
+    async def get_well_known_glama():
+        """Returns Glama MCP directory discovery manifest."""
+        public_url = (
+            os.getenv("PUBLIC_API_URL")
+            or os.getenv("WEB3_AGENT_URL")
+            or "https://web3-systemic-agent.onrender.com"
+        ).rstrip("/")
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "$schema": "https://glama.ai/mcp/schemas/server.json",
+                "name": "web3-systemic-agent",
+                "description": (
+                    "Autonomous Web3 Security and Governance Auditor MCP Server. Provides 3 free Stage 1 "
+                    "on-chain analysis tools (contract selectors, honeypot detection, Snapshot DAO scanning) "
+                    "and 1 paid Stage 2 Deep Semantic LLM Audit tool ($0.015 standard / $0.25 deep source audit "
+                    "via x402 USDC on Base)."
+                ),
+                "maintainers": ["RafaCoelho33"],
+                "homepage": public_url,
+                "repository": "https://github.com/RafaCoelho33/web3-systemic-agent",
+                "capabilities": {
+                    "tools": True,
+                    "resources": False,
+                    "prompts": False,
+                },
+            },
+        )
+
+    @app.api_route("/.well-known/x402", methods=["GET", "HEAD"], include_in_schema=False)
     async def get_well_known_x402():
         """Returns standard x402 Bazaar protocol auto-discovery specification."""
         x402_cfg: X402Config = getattr(app.state, "x402_config", None) or X402Config()
-        required_atomic = usdc_to_atomic(x402_cfg.price_per_eval_usdc)
         token_name = "USD Coin" if x402_cfg.network == "eip155:8453" else "USDC"
         public_url = (
             os.getenv("PUBLIC_API_URL")
             or os.getenv("WEB3_AGENT_URL")
             or "https://web3-systemic-agent.onrender.com"
         ).rstrip("/")
-
-        storage_inst = getattr(app.state, "storage", None)
-        is_legacy_hardening_test = bool(
-            storage_inst
-            and getattr(storage_inst, "db_path", None)
-            and "api_audit_test.db" in str(storage_inst.db_path)
-        )
 
         resource_endpoints = [
             (
@@ -1273,20 +2515,22 @@ def create_app(
                 x402_cfg.price_per_eval_usdc,
                 "Web3 Security & Governance Audit for /audit — EVM Pre-Transaction Security Firewall, Calldata Decoder & DAO Proposal Risk Auditor (Base, Ethereum, Arbitrum, Optimism)",
             ),
+            (
+                "/preflight",
+                x402_cfg.price_per_preflight_usdc,
+                "Web3 Preflight Transaction Security Firewall for /preflight — Pre-sign Simulation, Approval Screening & Prompt Injection Defense",
+            ),
+            (
+                "/audit/deep",
+                x402_cfg.price_per_deep_audit_usdc,
+                "Web3 Deep Source & Proxy Smart Contract Audit for /audit/deep — EIP-1967/1822 Proxy State Resolution & Verified Solidity Source Code Evaluation",
+            ),
+            (
+                "/token/check",
+                x402_cfg.price_per_token_check_usdc,
+                "Web3 Fast Token & Honeypot Scanner for /token/check — Instant EVM Bytecode Honeypot, Tax Trap, Proxy & Sourcify Verification Check",
+            ),
         ]
-        if not is_legacy_hardening_test:
-            resource_endpoints.extend([
-                (
-                    "/preflight",
-                    x402_cfg.price_per_preflight_usdc,
-                    "Web3 Preflight Transaction Security Firewall for /preflight — Pre-sign Simulation, Approval Screening & Prompt Injection Defense",
-                ),
-                (
-                    "/audit/deep",
-                    x402_cfg.price_per_deep_audit_usdc,
-                    "Web3 Deep Source & Proxy Smart Contract Audit for /audit/deep — EIP-1967/1822 Proxy State Resolution & Verified Solidity Source Code Evaluation",
-                ),
-            ])
 
         resources = []
         for path, price_usdc, desc in resource_endpoints:
@@ -1343,11 +2587,16 @@ def create_app(
             },
         )
 
-    @app.get("/.well-known/security.txt", include_in_schema=False)
-    @app.get("/security.txt", include_in_schema=False)
+    @app.api_route("/.well-known/security.txt", methods=["GET", "HEAD"], include_in_schema=False)
+    @app.api_route("/security.txt", methods=["GET", "HEAD"], include_in_schema=False)
     async def get_security_txt():
         """Returns RFC 9116 security vulnerability reporting policy."""
         return Response(content=SECURITY_TXT_CONTENT, media_type="text/plain; charset=utf-8")
+
+    @app.head("/health", include_in_schema=False)
+    async def head_health():
+        """HEAD probe handler for health endpoint."""
+        return Response(status_code=status.HTTP_200_OK, media_type="application/json")
 
     @app.get(
         "/health",
@@ -1425,7 +2674,7 @@ def create_app(
 
         return HealthCheckResponse(
             status=overall_status,
-            version="1.0.0",
+            version="1.0.2",
             timestamp=datetime.now(timezone.utc).isoformat(),
             rpc_status=rpc_status,
             semantic_provider=provider_type,
@@ -1566,12 +2815,7 @@ def create_app(
         required_atomic = usdc_to_atomic(required_usdc)
 
         # 1. Extract payment header
-        payment_header = (
-            request.headers.get("x-payment")
-            or request.headers.get("payment-signature")
-            or request.headers.get("X-PAYMENT")
-            or request.headers.get("PAYMENT-SIGNATURE")
-        )
+        payment_header = _extract_payment_header(request)
         if not payment_header:
             return build_402_response(x402_cfg, request.url.path, required_usdc)
 
@@ -1703,13 +2947,37 @@ def create_app(
         agent_resp.payment = receipt
         return agent_resp
 
-    @app.get("/audit", tags=["Evaluation"], summary="x402 Quick Audit Discovery Metadata")
-    async def audit_discovery(request: Request):
+    @app.get("/audit", tags=["Evaluation"], summary="x402 Quick Audit Discovery & Execution")
+    async def audit_discovery(
+        request: Request,
+        response: Response,
+        address: Optional[str] = None,
+        target_address: Optional[str] = None,
+        contract_address: Optional[str] = None,
+        chain_id: int = 8453,
+        proposal_description: Optional[str] = None,
+        calldata: str = "0x",
+    ):
         """
-        Returns HTTP 402 Payment Required response containing x402 payment requirements
-        and Bazaar auto-discovery extensions for simplified smart contract audits.
+        Executes a Quick Contract Audit when target address is passed via query parameters
+        (and x402 is disabled or payment header is present), or returns HTTP 402
+        Bazaar auto-discovery metadata when called without parameters/payment.
         """
         x402_cfg: X402Config = getattr(app.state, "x402_config", None) or X402Config()
+        raw_addr = address or target_address or contract_address
+        has_payment = bool(_extract_payment_header(request))
+        if raw_addr and (not x402_cfg.enabled or has_payment):
+            req_kwargs: Dict[str, Any] = {
+                "target_address": raw_addr,
+                "address": address,
+                "contract_address": contract_address,
+                "chain_id": chain_id,
+                "calldata": calldata,
+            }
+            if proposal_description is not None:
+                req_kwargs["proposal_description"] = proposal_description
+            audit_payload = QuickAuditRequest(**req_kwargs)
+            return await quick_audit(payload=audit_payload, request=request, response=response)
         return build_402_response(
             x402_cfg,
             "/audit",
@@ -1816,12 +3084,7 @@ def create_app(
         required_atomic = usdc_to_atomic(required_usdc)
 
         # 1. Extract payment header
-        payment_header = (
-            request.headers.get("x-payment")
-            or request.headers.get("payment-signature")
-            or request.headers.get("X-PAYMENT")
-            or request.headers.get("PAYMENT-SIGNATURE")
-        )
+        payment_header = _extract_payment_header(request)
         if not payment_header:
             return build_402_response(x402_cfg, request.url.path, required_usdc)
 
@@ -1953,13 +3216,49 @@ def create_app(
         agent_resp.payment = receipt
         return agent_resp
 
-    @app.get("/preflight", tags=["Evaluation"], summary="x402 Preflight Firewall Discovery Metadata")
-    async def preflight_discovery(request: Request):
+    @app.get("/preflight", tags=["Evaluation"], summary="x402 Preflight Firewall Discovery & Execution")
+    async def preflight_discovery(
+        request: Request,
+        response: Response,
+        to_address: Optional[str] = None,
+        target_address: Optional[str] = None,
+        from_address: Optional[str] = None,
+        calldata: str = "0x",
+        value_wei: int = 0,
+        chain_id: int = 8453,
+        run_simulation: bool = True,
+    ):
         """
-        Returns HTTP 402 Payment Required response containing x402 payment requirements
-        and Bazaar auto-discovery extensions for EVM preflight transaction firewall screening.
+        Executes Preflight EVM Transaction Firewall screening when target/calldata query parameters
+        are supplied (and x402 is disabled or payment header is present), or returns HTTP 402
+        Bazaar auto-discovery metadata when called without parameters/payment.
         """
         x402_cfg: X402Config = getattr(app.state, "x402_config", None) or X402Config()
+        has_payment = bool(_extract_payment_header(request))
+        has_target_or_calldata = bool(
+            to_address or target_address or (calldata and calldata != "0x")
+        )
+        if has_target_or_calldata and (not x402_cfg.enabled or has_payment):
+            try:
+                preflight_payload = PreflightRequest(
+                    chain_id=chain_id,
+                    from_address=from_address,
+                    to_address=to_address,
+                    target_address=target_address,
+                    calldata=calldata,
+                    value_wei=value_wei,
+                    run_simulation=run_simulation,
+                )
+            except ValidationError as exc:
+                return JSONResponse(
+                    status_code=422,
+                    content=jsonable_encoder({
+                        "error": "RequestValidationError",
+                        "message": "Invalid preflight query parameters.",
+                        "details": exc.errors(),
+                    }),
+                )
+            return await preflight_tx(payload=preflight_payload, request=request, response=response)
         return build_402_response(
             x402_cfg,
             "/preflight",
@@ -2405,6 +3704,425 @@ def create_app(
         agent_resp.payment = receipt
         return agent_resp
 
+    async def _handle_token_check(
+        raw_addr: Optional[str],
+        chain_id: int,
+        include_source_status: bool,
+        request: Request,
+        response: Response,
+        is_get: bool = False,
+    ):
+        """
+        Unified handler for GET and POST /token/check ($0.005 USDC micro-tier).
+        Performs zero-LLM deterministic bytecode honeypot detection, selector scanning,
+        and optional Sourcify/proxy verification resolution with x402 no-charge-on-error guarantees.
+        """
+        x402_cfg: X402Config = getattr(app.state, "x402_config", None) or X402Config()
+        storage_inst: Optional[AgentStorage] = getattr(app.state, "storage", None)
+        required_usdc = x402_cfg.price_per_token_check_usdc
+        required_atomic = usdc_to_atomic(required_usdc)
+        facilitator = getattr(app.state, "facilitator", None) or MockX402Facilitator()
+
+        payment_data: Optional[Dict[str, Any]] = None
+        if x402_cfg.enabled:
+            payment_header = _extract_payment_header(request)
+            if not payment_header:
+                return build_402_response(x402_cfg, "/token/check", required_usdc)
+
+            if not raw_addr or not isinstance(raw_addr, str) or not Web3.is_address(raw_addr):
+                return JSONResponse(
+                    status_code=422,
+                    content={
+                        "error": "RequestValidationError",
+                        "message": "Missing or invalid EVM token address for /token/check.",
+                        "details": [
+                            {
+                                "loc": ["query" if is_get else "body", "address"],
+                                "msg": "Invalid or missing EVM hex address",
+                                "type": "value_error",
+                            }
+                        ],
+                    },
+                )
+
+            try:
+                payment_data = parse_x402_header(payment_header, default_network=x402_cfg.network)
+            except ValueError as exc:
+                return build_402_response(
+                    x402_cfg,
+                    "/token/check",
+                    required_usdc,
+                    reason=f"Malformed payment header: {exc}",
+                )
+
+            payment_data["endpoint"] = "/token/check"
+            payment_id = payment_data["payment_id"]
+            if storage_inst and await storage_inst.is_payment_settled(payment_id):
+                return build_402_response(
+                    x402_cfg,
+                    "/token/check",
+                    required_usdc,
+                    reason="Payment already settled (replay detected)",
+                )
+
+            ver = await facilitator.verify(payment_data, required_atomic, x402_cfg)
+            if not ver.valid:
+                return build_402_response(
+                    x402_cfg,
+                    "/token/check",
+                    required_usdc,
+                    reason=ver.reason or "Payment verification failed",
+                )
+        else:
+            if is_get and (not raw_addr or not str(raw_addr).strip()):
+                return build_402_response(x402_cfg, "/token/check", required_usdc)
+            if not raw_addr or not isinstance(raw_addr, str) or not Web3.is_address(raw_addr):
+                return JSONResponse(
+                    status_code=422,
+                    content={
+                        "error": "RequestValidationError",
+                        "message": "Missing or invalid EVM token address for /token/check.",
+                        "details": [
+                            {
+                                "loc": ["query" if is_get else "body", "address"],
+                                "msg": "Invalid or missing EVM hex address",
+                                "type": "value_error",
+                            }
+                        ],
+                    },
+                )
+
+        checksum_addr = Web3.to_checksum_address(raw_addr)
+        try:
+            cid = ChainId(chain_id)
+            cid_int = int(cid.value)
+        except ValueError:
+            cid_int = (
+                int(chain_id)
+                if chain_id in ChainInspector.DEFAULT_RPCS
+                else int(ChainId.BASE_MAINNET.value)
+            )
+
+        inspector = ChainInspector(chain_id=cid_int)
+        cache_key = f"{cid_int}:{checksum_addr}"
+        code_bytes: Optional[bytes] = None
+
+        if cache_key in inspector._bytecode_cache:
+            code_bytes = inspector._bytecode_cache[cache_key]
+        else:
+            last_exc: Optional[Exception] = None
+            for idx, url in enumerate(inspector.rpc_urls):
+                w3 = (
+                    inspector.w3
+                    if idx == 0
+                    else inspector._get_or_create_w3(cid_int, url, use_cache=inspector.use_cache)
+                )
+                try:
+                    raw_code = await w3.eth.get_code(checksum_addr)
+                    if isinstance(raw_code, str):
+                        clean_hex = raw_code[2:] if raw_code.startswith("0x") else raw_code
+                        code_bytes = bytes.fromhex(clean_hex) if clean_hex else b""
+                    else:
+                        code_bytes = bytes(raw_code) if raw_code else b""
+                    inspector._set_bytecode_cache(cache_key, code_bytes)
+                    break
+                except Exception as exc:
+                    logger.warning(
+                        "TokenCheck RPC get_code failed for URL %s (chain %s): %s",
+                        url,
+                        cid_int,
+                        exc,
+                    )
+                    last_exc = exc
+
+            if code_bytes is None:
+                if storage_inst is not None:
+                    await storage_inst.log_error(
+                        stage="api",
+                        error_type="ServiceUnavailableNoCharge",
+                        message=f"All RPCs failed fetching bytecode for {checksum_addr}: {last_exc}",
+                        context={"path": "/token/check"},
+                    )
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "ServiceUnavailable",
+                        "message": "Execution failed due to upstream RPC error. Payment was NOT settled.",
+                        "payment_settled": False,
+                    },
+                )
+
+        if len(code_bytes) == 0:
+            is_contract = False
+            bytecode_size_bytes = 0
+            verdict = "EOA"
+            risk_score = 0.0
+            is_honeypot = False
+            threat_categories: List[str] = []
+            honeypot_flags: List[str] = []
+            selectors_found: List[Dict[str, Any]] = []
+            high_risk_selectors: List[str] = []
+            is_proxy = False
+            implementation_address: Optional[str] = None
+            source_verified = False
+            source_provider: Optional[str] = None
+            security_warnings: List[str] = []
+            summary = (
+                f"Address {checksum_addr} on chain {cid_int} is an Externally Owned Account (EOA) "
+                f"with 0 bytes of deployed bytecode."
+            )
+        else:
+            is_contract = True
+            bytecode_size_bytes = len(code_bytes)
+
+            if analyze_bytecode_honeypot is not None:
+                hp_analysis = analyze_bytecode_honeypot(code_bytes)
+            else:
+                hp_analysis = {
+                    "selectors": [],
+                    "honeypot_flags": [],
+                    "categories": {},
+                    "is_honeypot": False,
+                    "severity": "CLEAN",
+                    "summary_display": "CLEAN",
+                }
+
+            if extract_selectors_from_bytecode is not None:
+                selectors_found = extract_selectors_from_bytecode(code_bytes)
+            else:
+                selectors_found = list(hp_analysis.get("selectors", []))
+
+            seen_sel_hex = {str(s.get("selector", "")).lower() for s in selectors_found}
+            for hp_sel in hp_analysis.get("selectors", []):
+                sel_hex = str(hp_sel.get("selector", "")).lower()
+                if sel_hex and sel_hex not in seen_sel_hex:
+                    selectors_found.append(hp_sel)
+                    seen_sel_hex.add(sel_hex)
+
+            high_risk_selectors = []
+            if is_high_risk_signature is not None:
+                for sel_item in selectors_found:
+                    sig = str(sel_item.get("signature", ""))
+                    if sig and is_high_risk_signature(sig) and sig not in high_risk_selectors:
+                        high_risk_selectors.append(sig)
+
+            is_honeypot = bool(hp_analysis.get("is_honeypot", False))
+            honeypot_flags = list(hp_analysis.get("honeypot_flags", []))
+            categories_map = hp_analysis.get("categories", {})
+            threat_categories = [
+                cat for cat, items in categories_map.items() if items
+            ]
+
+            is_proxy = False
+            implementation_address = None
+            source_verified = False
+            source_provider = None
+            security_warnings = []
+
+            if include_source_status:
+                resolver = getattr(app.state, "source_resolver", None) or ContractSourceResolver()
+                try:
+                    audit_ctx = await resolver.resolve_full_audit_context(
+                        chain_id=cid_int,
+                        target_address=checksum_addr,
+                        resolve_proxy=True,
+                        fetch_source=True,
+                    )
+                    proxy_info = audit_ctx.get("proxy_info", {})
+                    source_info = audit_ctx.get("source_info", {})
+                    is_proxy = bool(proxy_info.get("is_proxy", False))
+                    implementation_address = proxy_info.get("implementation_address")
+                    source_verified = bool(source_info.get("verified", False))
+                    source_provider = source_info.get("provider")
+                    security_warnings = list(audit_ctx.get("security_warnings", []))
+                except Exception as exc:
+                    logger.warning(
+                        "Source/proxy resolution failed in /token/check for %s: %s",
+                        checksum_addr,
+                        exc,
+                    )
+                    security_warnings.append(f"Source/proxy lookup unavailable: {exc}")
+
+            severity = str(hp_analysis.get("severity", "CLEAN")).upper()
+            if is_honeypot:
+                base_score = 9.0 if severity == "CRITICAL" else 8.5
+                risk_score = min(
+                    10.0,
+                    round(base_score + min(1.0, 0.25 * max(0, len(honeypot_flags) - 1)), 2),
+                )
+            else:
+                score = 0.5
+                if severity == "CRITICAL":
+                    score = max(score, 8.5)
+                elif severity == "HIGH":
+                    score = max(score, 7.0)
+                elif severity == "MEDIUM":
+                    score = max(score, 5.0)
+                if high_risk_selectors:
+                    score = max(score, 4.5)
+                    score = min(7.5, score + min(1.5, 0.5 * len(high_risk_selectors)))
+                if is_proxy:
+                    score = max(score, 4.0)
+                    if high_risk_selectors:
+                        score = min(7.5, score + 0.5)
+                if include_source_status and not source_verified:
+                    score = max(score, 4.0)
+                    if high_risk_selectors or is_proxy:
+                        score = min(7.5, score + 0.5)
+                risk_score = round(min(10.0, score), 2)
+
+            if is_honeypot or risk_score >= 8.0:
+                verdict = "DANGEROUS"
+            elif (
+                high_risk_selectors
+                or is_proxy
+                or (include_source_status and not source_verified)
+                or risk_score >= 4.0
+            ):
+                verdict = "CAUTION"
+            else:
+                verdict = "SAFE"
+
+            summary_parts = [
+                f"Token/contract {checksum_addr} on chain {cid_int} ({bytecode_size_bytes} bytes): "
+                f"verdict={verdict}, risk_score={risk_score}/10.0."
+            ]
+            if honeypot_flags:
+                summary_parts.append(f"Honeypot flags: {', '.join(honeypot_flags[:4])}.")
+            if high_risk_selectors:
+                summary_parts.append(f"Privileged selectors: {', '.join(high_risk_selectors[:4])}.")
+            if is_proxy:
+                summary_parts.append(
+                    f"Upgradeable proxy -> implementation {implementation_address or 'unknown'}."
+                )
+            if include_source_status:
+                summary_parts.append(
+                    f"Source verified: {source_verified}"
+                    + (f" ({source_provider})" if source_provider else "")
+                    + "."
+                )
+            summary = " ".join(summary_parts)
+
+        receipt: Optional[PaymentReceipt] = None
+        if x402_cfg.enabled and payment_data is not None:
+            settlement = await facilitator.settle(payment_data, required_atomic, x402_cfg)
+            if not settlement.settled:
+                if storage_inst is not None:
+                    await storage_inst.log_error(
+                        stage="payment",
+                        error_type="SettlementError",
+                        message=settlement.error or "Failed to settle",
+                        context={"path": "/token/check"},
+                    )
+                return build_402_response(
+                    x402_cfg,
+                    "/token/check",
+                    required_usdc,
+                    reason=settlement.error or "Payment settlement failed",
+                )
+
+            _log_x402_settled(
+                "/token/check",
+                required_usdc,
+                settlement.tx_hash,
+                payment_data.get("network") or x402_cfg.network,
+            )
+
+            receipt = PaymentReceipt(
+                payment_id=payment_data["payment_id"],
+                payer_address=payment_data["payer_address"],
+                pay_to_address=x402_cfg.pay_to_address,
+                amount_usdc=round(required_usdc, 6),
+                amount_atomic=required_atomic,
+                network=payment_data.get("network") or x402_cfg.network,
+                asset=x402_cfg.asset,
+                tx_hash=settlement.tx_hash or "",
+                endpoint="/token/check",
+                settled_at=datetime.now(timezone.utc).isoformat(),
+            )
+
+            if storage_inst is not None:
+                await storage_inst.record_payment(
+                    receipt, rule_id=f"token-check-{checksum_addr.lower()[:10]}"
+                )
+
+            receipt_summary = json.dumps({
+                "tx_hash": receipt.tx_hash,
+                "payment_id": receipt.payment_id,
+                "amount_usdc": receipt.amount_usdc,
+            })
+            response.headers["X-PAYMENT-RESPONSE"] = receipt_summary
+            response.headers["PAYMENT-RESPONSE"] = receipt_summary
+
+        public_url = _get_public_url()
+        return TokenCheckResponse(
+            address=checksum_addr,
+            chain_id=cid_int,
+            is_contract=is_contract,
+            bytecode_size_bytes=bytecode_size_bytes,
+            verdict=verdict,
+            risk_score=risk_score,
+            is_honeypot_suspect=is_honeypot,
+            threat_categories=threat_categories,
+            honeypot_flags=honeypot_flags,
+            selectors_found=selectors_found,
+            high_risk_selectors=high_risk_selectors,
+            is_proxy=is_proxy,
+            implementation_address=implementation_address,
+            source_verified=source_verified,
+            source_provider=source_provider,
+            security_warnings=security_warnings,
+            summary=summary,
+            deep_audit_url=f"{public_url}/audit/deep",
+            report_url=f"{public_url}/report/{cid_int}/{checksum_addr}",
+            llm_invoked=False,
+            payment=receipt,
+        )
+
+    @app.get("/token/check", tags=["Evaluation"], summary="Fast Micro-Tier Token & Honeypot Check (GET)")
+    async def token_check_get(
+        request: Request,
+        response: Response,
+        address: Optional[str] = None,
+        token: Optional[str] = None,
+        token_address: Optional[str] = None,
+        chain_id: int = 8453,
+        include_source_status: bool = True,
+    ):
+        """
+        Micro-tier ($0.005 USDC) fast deterministic token safety & honeypot scanner via GET query params.
+        Returns HTTP 402 discovery metadata when called without address/payment.
+        """
+        raw_addr = address or token or token_address
+        return await _handle_token_check(
+            raw_addr=raw_addr,
+            chain_id=chain_id,
+            include_source_status=include_source_status,
+            request=request,
+            response=response,
+            is_get=True,
+        )
+
+    @app.post("/token/check", response_model=TokenCheckResponse, tags=["Evaluation"])
+    async def token_check_post(
+        payload: TokenCheckRequest,
+        request: Request,
+        response: Response,
+    ):
+        """
+        Micro-tier ($0.005 USDC) fast deterministic token safety & honeypot scanner via POST JSON.
+        Zero LLM token cost (llm_invoked=False).
+        """
+        raw_addr = payload.address or payload.token_address or payload.target_address
+        return await _handle_token_check(
+            raw_addr=raw_addr,
+            chain_id=payload.chain_id,
+            include_source_status=payload.include_source_status,
+            request=request,
+            response=response,
+            is_get=False,
+        )
+
     @app.post("/rules/evaluate-batch", response_model=List[FinalAgentResponse], tags=["Evaluation"])
     async def evaluate_rules_batch(
         payloads: List[ConditionRulePayload],
@@ -2457,12 +4175,7 @@ def create_app(
         required_atomic = usdc_to_atomic(required_usdc)
 
         # 1. Extract payment header
-        payment_header = (
-            request.headers.get("x-payment")
-            or request.headers.get("payment-signature")
-            or request.headers.get("X-PAYMENT")
-            or request.headers.get("PAYMENT-SIGNATURE")
-        )
+        payment_header = _extract_payment_header(request)
         if not payment_header:
             return build_402_response(x402_cfg, request.url.path, required_usdc)
 
@@ -2621,12 +4334,7 @@ def create_app(
         required_atomic = usdc_to_atomic(required_usdc)
 
         # 1. Extract payment header
-        payment_header = (
-            request.headers.get("x-payment")
-            or request.headers.get("payment-signature")
-            or request.headers.get("X-PAYMENT")
-            or request.headers.get("PAYMENT-SIGNATURE")
-        )
+        payment_header = _extract_payment_header(request)
         if not payment_header:
             return build_402_response(x402_cfg, request.url.path, required_usdc)
 
@@ -2764,7 +4472,7 @@ def create_app(
         }
 
     @app.get("/metrics/summary", tags=["Monitoring"], include_in_schema=not effective_public_evaluate_only)
-    async def get_metrics_summary(target_price: float = 0.01):
+    async def get_metrics_summary(target_price: float = 0.015):
         """
         Retrieves aggregated operational, token, cost, and error metrics from the ledger database.
         """

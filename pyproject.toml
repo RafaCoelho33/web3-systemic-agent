@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "web3-systemic-agent"
-version = "1.0.1"
+version = "1.0.2"
 description = "Autonomous Web3 Security and Governance Auditor MCP Server with Two-Stage Hybrid LLM Pipeline and x402 Micropayments"
 readme = "README.md"
 requires-python = ">=3.11"
