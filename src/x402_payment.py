@@ -521,6 +521,26 @@ def build_bazaar_discovery_extension(endpoint: str = "/evaluate", method: str = 
     """
     clean_ep = str(endpoint or "/evaluate").rstrip("/")
     http_method = (method or "POST").strip().upper()
+    default_rule_sample = {
+        "rule_id": "example-audit-01",
+        "chain_id": 8453,
+        "deterministic": {
+            "target_address": "0x4200000000000000000000000000000000000006",
+            "min_value_wei": 0,
+            "required_function_selectors": ["0xf2fde38b"],
+            "check_native_balance": False,
+        },
+        "semantic": {
+            "enabled": True,
+            "policy_prompt": "Audit transaction calldata and governance proposal for security risks",
+            "risk_threshold": 7.0,
+        },
+        "context_metadata": {
+            "calldata": "0xf2fde38b000000000000000000000000deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "proposal_description": "DAO Governance yield optimization parameter update",
+            "tx_value_wei": 0,
+        },
+    }
     if clean_ep.endswith("/token/check"):
         sample_input = {
             "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
@@ -592,27 +612,34 @@ def build_bazaar_discovery_extension(endpoint: str = "/evaluate", method: str = 
         }
         input_schema = QuickAuditRequest.model_json_schema()
         output_schema = FinalAgentResponse.model_json_schema()
-    else:
-        sample_input = {
-            "rule_id": "example-audit-01",
-            "chain_id": 8453,
-            "deterministic": {
-                "target_address": "0x4200000000000000000000000000000000000006",
-                "min_value_wei": 0,
-                "required_function_selectors": ["0xf2fde38b"],
-                "check_native_balance": False,
-            },
-            "semantic": {
-                "enabled": True,
-                "policy_prompt": "Audit transaction calldata and governance proposal for security risks",
-                "risk_threshold": 7.0,
-            },
-            "context_metadata": {
-                "calldata": "0xf2fde38b000000000000000000000000deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-                "proposal_description": "DAO Governance yield optimization parameter update",
-                "tx_value_wei": 0,
-            },
+    elif clean_ep.endswith("/rules/evaluate-batch"):
+        sample_input = [default_rule_sample]
+        sample_output_example = [{"rule_id": "example-audit-01", "chain_id": 8453, "llm_invoked": True}]
+        input_schema = {
+            "type": "array",
+            "items": ConditionRulePayload.model_json_schema(),
+            "minItems": 1,
+            "maxItems": 50,
         }
+        output_schema = {
+            "type": "array",
+            "items": FinalAgentResponse.model_json_schema(),
+        }
+    elif clean_ep.endswith("/rules/enqueue"):
+        sample_input = default_rule_sample
+        sample_output_example = {"job_id": "job-example-01", "status": "QUEUED"}
+        input_schema = ConditionRulePayload.model_json_schema()
+        output_schema = {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string"},
+                "status": {"type": "string"},
+                "payment": {"type": "object"},
+            },
+            "required": ["job_id", "status"],
+        }
+    else:
+        sample_input = default_rule_sample
         sample_output_example = {
             "rule_id": "example-audit-01",
             "chain_id": 8453,
