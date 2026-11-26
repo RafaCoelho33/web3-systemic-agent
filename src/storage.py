@@ -219,6 +219,11 @@ class AgentStorage:
                     os.makedirs(parent_dir, exist_ok=True)
 
                 async with aiosqlite.connect(self.db_path) as db:
+                    if self.db_path != ":memory:":
+                        await db.execute("PRAGMA journal_mode=WAL")
+                        await db.execute("PRAGMA synchronous=NORMAL")
+                        await db.execute("PRAGMA busy_timeout=5000")
+
                     await db.execute(
                         """
                         CREATE TABLE IF NOT EXISTS evaluations (
@@ -511,6 +516,41 @@ class AgentStorage:
         """
         return await self.get_evaluations(limit=limit, rule_id=rule_id)
 
+    async def get_recent_feed_evaluations(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """
+        Retrieves the most recent evaluations for the public security feed,
+        selecting feed-relevant columns safely and returning [] on failure.
+        """
+        try:
+            if not is_valid_sqlite_path(self.db_path):
+                return []
+
+            if not self._initialized:
+                await self.initialize()
+
+            if aiosqlite is None:
+                return []
+
+            safe_limit = max(1, int(limit))
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    """
+                    SELECT id, created_at, rule_id, chain_id, source,
+                           stage1_passed, llm_invoked, decision, risk_score,
+                           latency_ms, status, request_json, response_json
+                    FROM evaluations
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (safe_limit,),
+                )
+                rows = await cursor.fetchall()
+                return [dict(r) for r in rows]
+        except Exception as exc:
+            logger.warning(f"AgentStorage failed to get recent feed evaluations from {self.db_path}: {exc}")
+            return []
+
     async def get_errors(
         self, limit: int = 100, stage: Optional[str] = None
     ) -> List[Dict[str, Any]]:
@@ -714,7 +754,9 @@ class AgentStorage:
 
             async with aiosqlite.connect(self.db_path) as db:
                 db.row_factory = aiosqlite.Row
-                async with db.execute("SELECT * FROM evaluations ORDER BY id ASC") as cursor:
+                async with db.execute(
+                    "SELECT stage1_passed, llm_invoked, input_tokens, output_tokens, est_cost_usd FROM evaluations ORDER BY id ASC"
+                ) as cursor:
                     eval_rows = await cursor.fetchall()
                 async with db.execute(
                     "SELECT stage, COUNT(*) as count FROM error_log GROUP BY stage"

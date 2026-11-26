@@ -79,7 +79,7 @@ class TestMCPProtocolHandshakeAndDiscovery:
         assert "resources" in result["capabilities"]
         assert "prompts" in result["capabilities"]
         assert result["serverInfo"]["name"] == "web3-systemic-agent"
-        assert result["serverInfo"]["version"] == "1.0.0"
+        assert result["serverInfo"]["version"] == "1.0.2"
         assert "instructions" in result
         assert isinstance(result["instructions"], str)
         assert len(result["instructions"].strip()) > 0
@@ -111,9 +111,9 @@ class TestMCPProtocolHandshakeAndDiscovery:
 
     @pytest.mark.asyncio
     async def test_mcp_tools_list_schema(self, server: Web3SystemicMCPServer):
-        """Validates 'tools/list' and get_tools_manifest() return all 4 required tools with valid inputSchema and outputSchema."""
+        """Validates 'tools/list' and get_tools_manifest() return all 6 required tools with valid inputSchema and outputSchema."""
         manifest = server.get_tools_manifest()
-        assert len(manifest) == 4
+        assert len(manifest) == 6
         for t in manifest:
             assert "outputSchema" in t, f"Tool {t.get('name')} in get_tools_manifest() missing 'outputSchema'"
             out_schema = t["outputSchema"]
@@ -131,7 +131,7 @@ class TestMCPProtocolHandshakeAndDiscovery:
         assert res is not None
         assert res["id"] == 2
         tools = res["result"]["tools"]
-        assert len(tools) == 4
+        assert len(tools) == 6
 
         tool_map = {t["name"]: t for t in tools}
         expected_tools = {
@@ -139,6 +139,8 @@ class TestMCPProtocolHandshakeAndDiscovery:
             "check_token_honeypot",
             "scan_dao_proposals",
             "deep_semantic_audit",
+            "preflight_tx_firewall",
+            "inspect_proxy_and_source",
         }
         assert set(tool_map.keys()) == expected_tools
 
@@ -167,7 +169,7 @@ class TestMCPProtocolHandshakeAndDiscovery:
         - title: non-empty string
         """
         manifest = server.get_tools_manifest()
-        assert len(manifest) == 4
+        assert len(manifest) == 6
 
         req = {
             "jsonrpc": "2.0",
@@ -192,14 +194,27 @@ class TestMCPProtocolHandshakeAndDiscovery:
 
     @pytest.mark.asyncio
     async def test_mcp_resources_and_prompts_list(self, server: Web3SystemicMCPServer):
-        """Validates 'resources/list' and 'prompts/list' return valid structures."""
+        """Validates 'resources/list' and 'prompts/list' return the 4 Wave 2 resources and 3 prompts."""
         res_resources = await server.handle_jsonrpc({"jsonrpc": "2.0", "id": 10, "method": "resources/list"})
         assert res_resources is not None
-        assert res_resources["result"] == {"resources": []}
+        resources = res_resources["result"]["resources"]
+        assert len(resources) == 4
+        assert {r["uri"] for r in resources} == {
+            "web3://x402/pricing",
+            "web3://security/selectors-catalog",
+            "web3://feed/dao-curated-proposals",
+            "web3://feed/recent-audits",
+        }
 
         res_prompts = await server.handle_jsonrpc({"jsonrpc": "2.0", "id": 11, "method": "prompts/list"})
         assert res_prompts is not None
-        assert res_prompts["result"] == {"prompts": []}
+        prompts = res_prompts["result"]["prompts"]
+        assert len(prompts) == 3
+        assert {p["name"] for p in prompts} == {
+            "audit-token-before-swap",
+            "pre-sign-transaction-firewall",
+            "audit-dao-governance-space",
+        }
 
     @pytest.mark.asyncio
     async def test_mcp_unknown_method_returns_32601(self, server: Web3SystemicMCPServer):
@@ -422,12 +437,13 @@ class TestMCPStage2PaidTool:
     """Validates Stage 2 paid tool monetization gatekeeping, x402 402 responses, and audit completion."""
 
     @pytest.mark.asyncio
-    async def test_deep_semantic_audit_without_payment_returns_402(self):
+    async def test_deep_semantic_audit_without_payment_returns_402(self, monkeypatch):
         """
         Validates deep_semantic_audit without x402_payment_header and without buyer_private_key
         (require_x402_for_deep_audit=True): returns status='payment_required', status_code=402,
-        price_usdc=0.05, network='eip155:8453', and pre-validated rule_payload.
+        price_usdc=0.015, network='eip155:8453', and pre-validated rule_payload.
         """
+        monkeypatch.delenv("X402_PRICE_EVALUATE", raising=False)
         server = Web3SystemicMCPServer(
             buyer_private_key=None,
             require_x402_for_deep_audit=True,
@@ -444,7 +460,7 @@ class TestMCPStage2PaidTool:
         assert res.get("status_code") == 402
         assert res.get("protocol") == "x402"
         assert res.get("network") == "eip155:8453"
-        assert res.get("price_usdc") == 0.05
+        assert res.get("price_usdc") == 0.015
         assert "rule_payload" in res
 
         payload = res["rule_payload"]
@@ -510,23 +526,25 @@ class TestFastAPIMCPEndpoints:
         return TestClient(app)
 
     def test_get_mcp_discovery_in_lockdown(self, test_client: TestClient):
-        """Validates GET /mcp is whitelisted and returns 4 tools manifest when PUBLIC_EVALUATE_ONLY=true."""
+        """Validates GET /mcp is whitelisted and returns 6 tools manifest when PUBLIC_EVALUATE_ONLY=true."""
         response = test_client.get("/mcp")
         assert response.status_code == 200
 
         data = response.json()
         assert data["name"] == "web3-systemic-agent"
-        assert data["version"] == "1.0.0"
+        assert data["version"] == "1.0.2"
         assert data["protocolVersion"] == "2024-11-05"
         assert data["transport"] == "streamable-http"
         assert "tools" in data
-        assert len(data["tools"]) == 4
+        assert len(data["tools"]) == 6
 
         tool_names = [t["name"] for t in data["tools"]]
         assert "scan_contract_selectors" in tool_names
         assert "check_token_honeypot" in tool_names
         assert "scan_dao_proposals" in tool_names
         assert "deep_semantic_audit" in tool_names
+        assert "preflight_tx_firewall" in tool_names
+        assert "inspect_proxy_and_source" in tool_names
 
     def test_post_mcp_initialize_in_lockdown(self, test_client: TestClient):
         """Validates POST /mcp with 'initialize' succeeds over HTTP in lockdown mode."""
@@ -556,7 +574,7 @@ class TestFastAPIMCPEndpoints:
 
         data = response.json()
         assert data["id"] == "http-tools-1"
-        assert len(data["result"]["tools"]) == 4
+        assert len(data["result"]["tools"]) == 6
 
     def test_post_mcp_tools_call_in_lockdown(self, test_client: TestClient):
         """Validates POST /mcp with 'tools/call' executes tools over HTTP in lockdown mode."""
@@ -640,7 +658,7 @@ class TestMCPManifestsAndDryRunCLI:
         assert isinstance(data, dict)
         assert data["name"] == "web3-systemic-agent"
         assert "description" in data
-        assert data.get("capabilities", {}).get("tools") is True
+        assert data.get("capabilities") == {"tools": True, "resources": True, "prompts": True}
 
     def test_server_json_manifest_exists_and_valid(self):
         """
@@ -786,7 +804,7 @@ class TestMCPManifestsAndDryRunCLI:
             timeout=15,
         )
         assert proc.returncode == 0, f"CLI dry-run failed:\nstdout={proc.stdout}\nstderr={proc.stderr}"
-        assert "Registered 4 MCP tools" in proc.stdout
+        assert "Registered 6 MCP tools" in proc.stdout
         assert "All MCP self-tests PASSED successfully" in proc.stdout
 
 
@@ -871,7 +889,7 @@ class TestAgentDiscoveryTeachingAndSecurityHardening:
             assert data.get("serverInfo", {}).get("name") == "io.github.RafaCoelho33/web3-systemic-agent"
             assert data.get("protocolVersion") == "2024-11-05"
             assert "tools" in data
-            assert len(data["tools"]) == 4
+            assert len(data["tools"]) == 6
 
             tool_names = {t["name"] for t in data["tools"]}
             assert tool_names == {
@@ -879,6 +897,8 @@ class TestAgentDiscoveryTeachingAndSecurityHardening:
                 "check_token_honeypot",
                 "scan_dao_proposals",
                 "deep_semantic_audit",
+                "preflight_tx_firewall",
+                "inspect_proxy_and_source",
             }
 
         # Agent card

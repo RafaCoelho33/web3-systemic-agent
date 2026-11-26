@@ -750,7 +750,9 @@ class TestPhaseCBazaarAndCDPMainnet:
         assert "extensions" in data
         assert "bazaar" in data["extensions"]
         assert data["extensions"]["bazaar"]["info"]["input"]["method"] == "POST"
-        assert data["accepts"][0]["amount"] == "10000"
+        assert data["accepts"][0]["amount"] == "15000"
+        assert data["accepts"][0]["maxAmountRequired"] == "15000"
+        assert data["accepts"][0]["amount_usdc"] == 0.015
         assert data["accepts"][0]["asset"] == cfg.usdc_contract_address
 
     def test_coinbase_cdp_crawler_post_evaluate_empty_body_returns_402(self, temp_storage):

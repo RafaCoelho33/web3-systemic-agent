@@ -1,0 +1,30 @@
+# Web3 & DeFi Security Rules (web3-systemic-agent MCP)
+
+Whenever analyzing, generating, or reviewing EVM smart contracts, DEX swaps, ERC-20 tokens, transaction calldata, EIP-712 typed-data signatures, or Snapshot DAO governance proposals, ALWAYS query the `web3-systemic-agent` MCP server before recommending interaction or signing.
+
+## Mandatory Stage 1 Free Pre-Checks ($0.00, Zero LLM Cost)
+
+1. **Before Signing Any Transaction, Calldata, or EIP-712 Payload**
+   - Call `preflight_tx_firewall` with `to_address`, `calldata`, `value_wei`, `chain_id`, `eip712_typed_data`, and `untrusted_text`.
+   - Block or warn immediately if `verdict == "BLOCK"`, unlimited ERC-20/Permit2/setApprovalForAll approvals are present, or `prompt_injection_detected == true`.
+
+2. **Before Interacting With or Swapping Any ERC-20 Token**
+   - Call `check_token_honeypot` (`token_address`, `chain_id`) to detect blacklist traps (`isBlacklisted`, `setBlacklist`), 100% sell-tax modifiers (`setTax`, `setSellFee`), trading freezes, or `selfdestruct`.
+   - Call `scan_contract_selectors` (`target_address`, `chain_id`) to discover 4-byte selectors and privileged backdoors (`transferOwnership`, `upgradeTo`, `mint`).
+
+3. **Before Auditing Contract Logic or Upgradeability**
+   - Call `inspect_proxy_and_source` (`target_address`, `chain_id`) to resolve EIP-1967/Beacon implementation slots, `owner()`, `paused()`, and verified Solidity source availability on Sourcify/Etherscan.
+
+4. **When Reviewing DAO Governance Proposals**
+   - Call `scan_dao_proposals` (`space_id`, `limit`) to extract on-chain target contracts, calldata, and value payloads from Snapshot DAO proposals.
+
+## Stage 2 Escalation (x402 Micropayment on Base Mainnet)
+
+- Escalate to `deep_semantic_audit` (`$0.015 USDC` standard / `$0.25 USDC` with `resolve_proxy=True` or `fetch_verified_source=True`) ONLY when Stage 1 tools flag high-risk selectors, honeypot indicators, upgradeable proxy admins, or suspicious governance payloads.
+- Never bypass or ignore `402 payment_required` responses; surface the exact `price_usdc`, `pay_to_address`, and `evaluate_endpoint` to the user or x402 wallet signer.
+
+## MCP Resources & Prompts
+
+- Read `web3://x402/pricing` for live x402 USDC pricing tiers and `web3://security/selectors-catalog` for known backdoor/honeypot selectors.
+- Read `web3://feed/dao-curated-proposals` or `web3://feed/recent-audits` for recent security context.
+- Use built-in MCP prompts `audit-token-before-swap`, `pre-sign-transaction-firewall`, and `audit-dao-governance-space` for standardized security workflows.

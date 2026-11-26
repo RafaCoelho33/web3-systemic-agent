@@ -170,6 +170,23 @@ def _make_semantic_cache_key(
 
 
 DEFAULT_LLM_MAX_INPUT_CHARS = 32000
+SEMANTIC_CACHE_MAX = 512
+
+
+def _store_bounded_cache(
+    cache_dict: Dict[str, Any],
+    key: str,
+    value: Any,
+    max_entries: int = SEMANTIC_CACHE_MAX,
+) -> None:
+    """Stores an entry in cache_dict using FIFO eviction when max_entries is reached."""
+    if key in cache_dict:
+        cache_dict[key] = value
+        return
+    if max_entries > 0 and len(cache_dict) >= max_entries:
+        oldest_key = next(iter(cache_dict))
+        cache_dict.pop(oldest_key, None)
+    cache_dict[key] = value
 
 
 def get_llm_max_input_chars(override: Optional[int] = None) -> int:
@@ -405,7 +422,7 @@ class MockSemanticEvaluator:
             estimated_cost_usd=0.0,
             latency_ms=latency_ms,
         )
-        self._cache[cache_key] = result
+        _store_bounded_cache(self._cache, cache_key, result)
         return result
 
 
@@ -554,7 +571,7 @@ class OpenAISemanticEvaluator:
                     "flagged_issues": flagged_list,
                 }
             )
-            self._cache[cache_key] = final_res
+            _store_bounded_cache(self._cache, cache_key, final_res)
             return final_res
 
         except Exception as exc:
@@ -848,7 +865,7 @@ class GeminiSemanticEvaluator:
                     "flagged_issues": flagged_list,
                 }
             )
-            self._cache[cache_key] = final_res
+            _store_bounded_cache(self._cache, cache_key, final_res)
             return final_res
 
         except Exception as exc:

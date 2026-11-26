@@ -3,7 +3,7 @@
   "name": "io.github.RafaCoelho33/web3-systemic-agent",
   "title": "Web3 Systemic Agent",
   "description": "Web3 security & DAO auditor: free bytecode/honeypot/Snapshot tools + x402 Gemini LLM deep audit.",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "websiteUrl": "https://web3-systemic-agent.onrender.com",
   "icons": [
     {

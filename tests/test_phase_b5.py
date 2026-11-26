@@ -962,7 +962,7 @@ class TestSection3FastAPIEndpointAndExports:
         assert resp.status_code == 200
         data = resp.json()
         assert data["service"] == "Web3 Condition-Action Trigger Agent"
-        assert data["version"] == "1.0.0"
+        assert data["version"] == "1.0.2"
         assert data["status"] == "online"
         assert "x402_enabled" in data
         assert "x402_network" in data

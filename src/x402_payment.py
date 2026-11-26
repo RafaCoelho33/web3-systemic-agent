@@ -101,8 +101,9 @@ except ImportError as exc:
 
 # Protocol Constants
 USDC_DECIMALS: int = 6
-DEFAULT_X402_PRICE_USDC: float = 0.01
+DEFAULT_X402_PRICE_TOKEN_CHECK_USDC: float = 0.005
 DEFAULT_X402_PRICE_PREFLIGHT_USDC: float = 0.01
+DEFAULT_X402_PRICE_USDC: float = 0.015
 DEFAULT_X402_PRICE_DEEP_AUDIT_USDC: float = 0.25
 DEFAULT_X402_NETWORK: str = "eip155:84532"  # Base Sepolia
 DEFAULT_PAY_TO_ADDRESS: str = "0x0000000000000000000000000000000000000001"
@@ -154,6 +155,20 @@ def get_network_profile(network: str) -> Dict[str, Any]:
     return dict(NETWORK_PROFILES[key])
 
 
+def _get_public_api_url() -> str:
+    """Resolves the public API base URL from environment variables with Render fallback."""
+    return (
+        os.getenv("PUBLIC_API_URL")
+        or os.getenv("WEB3_AGENT_URL")
+        or "https://web3-systemic-agent.onrender.com"
+    ).rstrip("/")
+
+
+def _get_token_name(network: str) -> str:
+    """Resolves the EIP-712 token domain name for a CAIP-2 network identifier."""
+    return str(NETWORK_PROFILES.get(network, {}).get("token_name", "USDC"))
+
+
 def usdc_to_atomic(amount_usdc: float) -> int:
     """Converts a floating-point USDC amount into integer atomic units (6 decimals)."""
     return int(round(amount_usdc * (10 ** USDC_DECIMALS)))
@@ -169,6 +184,7 @@ class X402Config(BaseModel):
     Configuration for x402 payment gatekeeper, resolved from environment variables or explicit kwargs.
     """
     enabled: bool = Field(default=False, description="Whether x402 payment gatekeeper is active")
+    price_per_token_check_usdc: float = Field(default=DEFAULT_X402_PRICE_TOKEN_CHECK_USDC, ge=0.0, description="Price per fast token/honeypot check in USDC")
     price_per_eval_usdc: float = Field(default=DEFAULT_X402_PRICE_USDC, ge=0.0, description="Price per evaluation in USDC")
     price_per_preflight_usdc: float = Field(default=DEFAULT_X402_PRICE_PREFLIGHT_USDC, ge=0.0, description="Price per preflight check in USDC")
     price_per_deep_audit_usdc: float = Field(default=DEFAULT_X402_PRICE_DEEP_AUDIT_USDC, ge=0.0, description="Price per deep source/proxy audit in USDC")
@@ -184,6 +200,13 @@ class X402Config(BaseModel):
         if "enabled" not in data:
             env_val = os.getenv("X402_ENABLED", "false").strip().lower()
             data["enabled"] = env_val in ("true", "1", "yes")
+        if "price_per_token_check_usdc" not in data:
+            env_val = os.getenv("X402_PRICE_TOKEN_CHECK")
+            if env_val:
+                try:
+                    data["price_per_token_check_usdc"] = float(env_val)
+                except (ValueError, TypeError):
+                    pass
         if "price_per_eval_usdc" not in data:
             env_val = os.getenv("X402_PRICE_EVALUATE")
             if env_val:
@@ -473,13 +496,58 @@ class QuickAuditRequest(BaseModel):
     risk_threshold: float = Field(default=7.0, ge=0.0, le=10.0, description="Risk score threshold")
 
 
-def build_bazaar_discovery_extension(endpoint: str = "/evaluate") -> Dict[str, Any]:
+class TokenCheckRequest(BaseModel):
+    """Simplified payload schema for fast token/honeypot checks on /token/check."""
+    address: Optional[str] = Field(default=None, description="Hex EVM token contract address to check")
+    token_address: Optional[str] = Field(default=None, description="Alias for address")
+    target_address: Optional[str] = Field(default=None, description="Alias for address")
+    chain_id: int = Field(default=8453, description="EVM Chain ID (8453 Base Mainnet, 84532 Base Sepolia, 42161 Arbitrum One)")
+    include_source_status: bool = Field(default=True, description="Whether to check verified source status")
+
+    @field_validator("address", "token_address", "target_address")
+    @classmethod
+    def validate_and_normalize_address(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or v == "":
+            return None
+        if not Web3.is_address(v):
+            raise ValueError(f"Invalid Ethereum address: {v}")
+        return Web3.to_checksum_address(v)
+
+
+def build_bazaar_discovery_extension(endpoint: str = "/evaluate", method: str = "POST") -> Dict[str, Any]:
     """
     Constructs an x402 Bazaar auto-discovery extension declaring input/output JSON schemas
     and sample payloads for Agent-to-Agent discovery.
     """
     clean_ep = str(endpoint or "/evaluate").rstrip("/")
-    if clean_ep.endswith("/preflight"):
+    http_method = (method or "POST").strip().upper()
+    if clean_ep.endswith("/token/check"):
+        sample_input = {
+            "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            "chain_id": 8453,
+        }
+        sample_output_example = {
+            "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            "chain_id": 8453,
+            "is_contract": True,
+            "is_honeypot": False,
+            "severity": "CLEAN",
+            "llm_invoked": False,
+        }
+        input_schema = TokenCheckRequest.model_json_schema()
+        output_schema = {
+            "type": "object",
+            "properties": {
+                "address": {"type": "string"},
+                "chain_id": {"type": "integer"},
+                "is_contract": {"type": "boolean"},
+                "is_honeypot": {"type": "boolean"},
+                "severity": {"type": "string"},
+                "honeypot_flags": {"type": "array", "items": {"type": "string"}},
+                "llm_invoked": {"type": "boolean"},
+            },
+        }
+    elif clean_ep.endswith("/preflight"):
         sample_input = {
             "chain_id": 8453,
             "to_address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
@@ -568,7 +636,7 @@ def build_bazaar_discovery_extension(endpoint: str = "/evaluate") -> Dict[str, A
                 if isinstance(res["bazaar"], dict) and "info" in res["bazaar"]:
                     if isinstance(res["bazaar"]["info"], dict) and "input" in res["bazaar"]["info"]:
                         if isinstance(res["bazaar"]["info"]["input"], dict):
-                            res["bazaar"]["info"]["input"]["method"] = "POST"
+                            res["bazaar"]["info"]["input"]["method"] = http_method
             return res
         except Exception as exc:
             logger.warning("Failed to generate bazaar discovery extension via SDK: %s", exc)
@@ -578,7 +646,7 @@ def build_bazaar_discovery_extension(endpoint: str = "/evaluate") -> Dict[str, A
             "info": {
                 "input": {
                     "type": "http",
-                    "method": "POST",
+                    "method": http_method,
                     "bodyType": "json",
                     "body": sample_input,
                 },
@@ -959,7 +1027,7 @@ class HTTPX402Facilitator:
         full_resource_url = (
             endpoint
             if endpoint.startswith("http://") or endpoint.startswith("https://")
-            else f"https://web3-systemic-agent.onrender.com{endpoint if endpoint.startswith('/') else '/' + endpoint}"
+            else f"{_get_public_api_url()}{endpoint if endpoint.startswith('/') else '/' + endpoint}"
         )
         default_resource_obj = {
             "url": full_resource_url,
@@ -1077,7 +1145,7 @@ class HTTPX402Facilitator:
             if isinstance(accepted_data, dict):
                 req = PaymentRequirements.model_validate(accepted_data)
             else:
-                token_name = "USD Coin" if config.network == "eip155:8453" else "USDC"
+                token_name = _get_token_name(config.network)
                 req = PaymentRequirements(
                     scheme="exact",
                     network=config.network,
@@ -1124,7 +1192,7 @@ class HTTPX402Facilitator:
         url = f"{base_url}/verify"
         req_dict = payment_data.get("accepted")
         if not isinstance(req_dict, dict):
-            token_name = "USD Coin" if config.network == "eip155:8453" else "USDC"
+            token_name = _get_token_name(config.network)
             req_dict = {
                 "scheme": "exact",
                 "network": config.network,
@@ -1219,7 +1287,7 @@ class HTTPX402Facilitator:
                 req = PaymentRequirements.model_validate(accepted_data)
             else:
                 amount_atomic = int(payment_data.get("amount_atomic", required_atomic))
-                token_name = "USD Coin" if config.network == "eip155:8453" else "USDC"
+                token_name = _get_token_name(config.network)
                 req = PaymentRequirements(
                     scheme="exact",
                     network=config.network,
@@ -1264,7 +1332,7 @@ class HTTPX402Facilitator:
         req_dict = payment_data.get("accepted")
         if not isinstance(req_dict, dict):
             amount_atomic = int(payment_data.get("amount_atomic", required_atomic))
-            token_name = "USD Coin" if config.network == "eip155:8453" else "USDC"
+            token_name = _get_token_name(config.network)
             req_dict = {
                 "scheme": "exact",
                 "network": config.network,
@@ -1354,11 +1422,11 @@ def build_402_response(
     and Bazaar auto-discovery extensions.
     """
     required_atomic = usdc_to_atomic(required_usdc)
-    token_name = "USD Coin" if config.network == "eip155:8453" else "USDC"
+    token_name = _get_token_name(config.network)
     full_resource_url = (
         endpoint
         if endpoint.startswith("http://") or endpoint.startswith("https://")
-        else f"https://web3-systemic-agent.onrender.com{endpoint if endpoint.startswith('/') else '/' + endpoint}"
+        else f"{_get_public_api_url()}{endpoint if endpoint.startswith('/') else '/' + endpoint}"
     )
     resource_obj = {
         "url": full_resource_url,
