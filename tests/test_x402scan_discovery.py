@@ -799,3 +799,67 @@ class TestX402ScanRenderDockerParity:
                 assert isinstance(output_schema, dict) and len(output_schema) > 0, (
                     f"{method} {path} (HAS_X402_SDK={sdk_enabled}) missing non-empty schema.properties.output: {props!r}"
                 )
+
+
+# =============================================================================
+# 6. Glama & MCP Server Card Manifest Parity
+# =============================================================================
+class TestRenderGlamaAndMCPServerCardParity:
+    """Validates /.well-known/glama.json parity and MCP server-card manifests."""
+
+    def test_well_known_glama_json_matches_root_glama_manifest(
+        self, temp_storage: AgentStorage
+    ):
+        root_glama = json.loads(
+            (Path(ROOT_DIR) / "glama.json").read_text(encoding="utf-8")
+        )
+        app = _build_app(temp_storage)
+
+        with TestClient(app) as client:
+            resp = client.get("/.well-known/glama.json")
+            assert resp.status_code == 200
+            resp_json = resp.json()
+
+            assert resp_json["capabilities"] == {
+                "tools": True,
+                "resources": True,
+                "prompts": True,
+            }
+            assert resp_json["capabilities"] == root_glama["capabilities"]
+            assert "5 free" in resp_json["description"]
+            assert resp_json["name"] == root_glama["name"]
+
+    def test_well_known_mcp_server_cards_expose_resources_and_prompts_manifests(
+        self, temp_storage: AgentStorage
+    ):
+        expected_resource_uris = {
+            "web3://x402/pricing",
+            "web3://security/selectors-catalog",
+            "web3://feed/dao-curated-proposals",
+            "web3://feed/recent-audits",
+        }
+        expected_prompt_names = {
+            "audit-token-before-swap",
+            "pre-sign-transaction-firewall",
+            "audit-dao-governance-space",
+        }
+        endpoints = (
+            "/.well-known/mcp/server-card.json",
+            "/.well-known/mcp.json",
+            "/mcp/server-card",
+            "/mcp/server-card.json",
+        )
+        app = _build_app(temp_storage)
+
+        with TestClient(app) as client:
+            for endpoint in endpoints:
+                resp = client.get(endpoint)
+                assert resp.status_code == 200, (
+                    f"{endpoint} returned {resp.status_code}, expected 200"
+                )
+                data = resp.json()
+                assert len(data["tools"]) == 6
+                assert len(data["resources"]) == 4
+                assert len(data["prompts"]) == 3
+                assert {r["uri"] for r in data["resources"]} == expected_resource_uris
+                assert {p["name"] for p in data["prompts"]} == expected_prompt_names

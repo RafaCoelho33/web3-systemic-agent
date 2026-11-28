@@ -2759,8 +2759,8 @@ def create_app(
                 "schemes": ["none", "x402"],
             },
             "tools": mcp.get_tools_manifest(),
-            "resources": [],
-            "prompts": [],
+            "resources": mcp.get_resources_manifest(),
+            "prompts": mcp.get_prompts_manifest(),
         }
         return JSONResponse(status_code=status.HTTP_200_OK, content=card)
 
@@ -2854,18 +2854,19 @@ def create_app(
                 "$schema": "https://glama.ai/mcp/schemas/server.json",
                 "name": "web3-systemic-agent",
                 "description": (
-                    "Autonomous Web3 Security and Governance Auditor MCP Server. Provides 3 free Stage 1 "
-                    "on-chain analysis tools (contract selectors, honeypot detection, Snapshot DAO scanning) "
-                    "and 1 paid Stage 2 Deep Semantic LLM Audit tool ($0.015 standard / $0.25 deep source audit "
-                    "via x402 USDC on Base)."
+                    "Autonomous Web3 Security and Governance Auditor MCP Server. Provides 5 free Stage 1 "
+                    "on-chain analysis tools (contract selectors, honeypot detection, Snapshot DAO scanning, "
+                    "preflight transaction firewall, EIP-1967 proxy & verified source inspection), 1 paid "
+                    "Stage 2 Deep Semantic LLM Audit tool ($0.015 standard / $0.25 deep proxy + verified source "
+                    "audit via x402 USDC on Base), plus MCP resources and prompts."
                 ),
                 "maintainers": ["RafaCoelho33"],
                 "homepage": public_url,
                 "repository": "https://github.com/RafaCoelho33/web3-systemic-agent",
                 "capabilities": {
                     "tools": True,
-                    "resources": False,
-                    "prompts": False,
+                    "resources": True,
+                    "prompts": True,
                 },
             },
         )
